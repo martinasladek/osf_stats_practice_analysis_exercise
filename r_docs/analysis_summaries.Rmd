@@ -1,0 +1,1015 @@
+---
+title: "Analysis exercise: summary notes"
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+    toc_depth: 5
+---
+
+**IMPORTANT:** The following summaries require the model objects exported from `brms` to exist. Therefore to run the summaries, you need to first run the script `analysis_models.Rmd` that creates these objects. 
+
+**IMPORTANT:** The original dataset collected information about university name which was then paired with a world rank. Both of these variables could be used to identify participants at institutions which, at the time, did not tie on ranks with any other institutions. Because of this, the variables were removed from the dataset. 
+
+The variable `world_rank` was replaced with a randomly generated variable that correlated with the original rank with r = 0.9. Therefore the code below will still be able to run, however please note that any computations that use `world_rank` will not be exactly reproducible. 
+
+The main analysis in the file `analysis_models.Rmd` uses the actual data that was used to fit the models reported in the manuscript. The statistical models used a categorical version of the variable (`world_rank` split into 4 levels), which doesn't pose risk of de-identification and was therefore retained. Basically, the statistical models `analysis_models.Rmd` can be reproduced exactly, but not the imputation. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(mice)
+library(brms)
+
+library(tidybayes)
+library(HDInterval)
+
+source("../scripts/helpers.R")
+
+data <- readRDS("../data/processed_data/analysis_exercise_processed_data_2021_10_07_world_rank_de-identified.rds")
+imp_data_0 <- readRDS("../data/processed_data/imp_data_0_world_rank_removed.rds")
+
+mod_out_mi <- readRDS("../objects/models/mod_out_mi_220322.rds")
+mod_norm_mi <- readRDS("../objects/models/mod_norm_mi_220322.rds")
+mod_het_mi <- readRDS("../objects/models/mod_het_mi_220322.rds")
+mod_inf_mi_s1 <- readRDS("../objects/models/mod_inf_mi_s1_220322.rds")
+mod_inf_mi_s2 <- readRDS("../objects/models/mod_inf_mi_s2_220322.rds")
+
+
+env <- new.env()
+```
+
+Process original data for descriptives and plotting 
+
+```{r}
+data %<>%
+  dplyr::mutate(
+    
+    demo_level = case_when(
+      ri_teach == "Yes" & demo_level == "Faculty" ~ "Faculty who teach methods",
+      TRUE ~ demo_level
+    ),
+    
+    plot = if_else(plot == "No plot of raw data", 0, 1), 
+    
+    across(.cols = c(scenario, demo_level, ri_subfield), 
+           .fns = factor), 
+    # across(.cols = c(cat_norm, cat_het, cat_out, cat_inf),
+    #       .fns = ordered_factor),
+    
+    scenario = factor(scenario, labels = c("Experimental", "Cross-sectional")), 
+    ri_subfield = forcats::fct_relevel(ri_subfield, "Methods and meta-science", after = 0L), 
+    demo_level = factor(demo_level, levels = c("Faculty who teach methods", "Faculty", 
+                                               "Postdoctoral researcher", "PhD researcher", 
+                                               "Postgraduate taught student", "Nonacademic researcher")), 
+
+    # world_rank = case_when(
+    #   rank == -99 ~ as.integer(1500), 
+    #   rank == -999 ~ as.integer(-999), 
+    #   is.na(rank) ~ as.integer(NA),
+    #   TRUE ~ world_rank
+    # ), 
+    # uni_rank_cat = case_when(
+    #   world_rank == 1500 ~ 4, 
+    #   world_rank %in% c(501:1001) ~ 3,
+    #   world_rank %in% c(201:500) ~ 2,
+    #   world_rank %in% c(1:200) ~ 1
+    # )
+  ) #%>% 
+ # dplyr::select(-rank)
+
+model_data <- data %>% 
+  dplyr::filter(ri_subfield != "Forensic psychology" | is.na(ri_subfield), 
+                demo_level != "Postgraduate taught student" | is.na(demo_level), 
+                world_rank != -999 | is.na(world_rank)) %>% 
+  dplyr::mutate(
+    demo_level = droplevels(demo_level), 
+    ri_subfield = droplevels(ri_subfield)
+  )
+```
+
+
+```{r}
+env$data <- data
+env$model_data <- model_data
+env$imp_data_0 <- imp_data_0
+```
+
+
+```{r}
+model_data %>% 
+  dplyr::group_by(demo_level) %>% 
+  dplyr::summarise(n = n()/2)
+```
+
+
+## Descriptives 
+
+```{r}
+re_plot_data <- imp_data_0 %>% 
+  dplyr::select(id, scenario, cat_out, cat_inf, cat_norm, cat_het) %>%
+  tidyr::pivot_longer(
+    cols = c(cat_out, cat_inf, cat_norm, cat_het), 
+    names_to = "assumption", 
+    values_to = "practice_cat"
+  ) %>%
+  #dplyr::filter(!is.na(practice_cat)) %>% 
+  dplyr::group_by(assumption, id) %>%
+  dplyr::arrange(assumption, id, scenario) %>%
+  dplyr::mutate(
+    practice_diff = (as.numeric(practice_cat)[2] - as.numeric(practice_cat)[1]) %>% factor(., levels = c(-2, -1, 0, 1, 2)),
+    assumption = factor(assumption, levels = c("cat_out", "cat_inf", "cat_norm", "cat_het"))
+  ) %>% 
+  dplyr::arrange(assumption, id, scenario) # repeating this so position_jitter of geoms aligns 
+re_plot_data
+```
+
+#### Counts per group 
+
+```{r}
+re_plot_data %>% 
+  dplyr::group_by(assumption, scenario, practice_cat) %>% 
+  dplyr::summarise(n = n()) %>% 
+  tidyr::pivot_wider(
+    id_cols = c("practice_cat", "scenario"), 
+    values_from = "n",
+    names_from = "assumption"
+  ) %>% 
+  dplyr::arrange(practice_cat, scenario) %>% 
+  lazy_kable()
+```
+
+#### Counts per change 
+
+```{r}
+re_plot_data %>%
+  dplyr::filter(scenario == "s1") %>%
+  dplyr::group_by(assumption, practice_diff) %>%
+  dplyr::summarise(n = n()) %>% 
+  tidyr::pivot_wider(
+    id_cols = c("practice_diff"), 
+    values_from = "n",
+    names_from = "assumption"
+  ) %>% 
+  dplyr::arrange(practice_diff) %>% 
+  lazy_kable()
+```
+
+```{r fig.height = 8, fig.width = 12}
+re_plot_data %>% 
+  dplyr::filter(!is.na(practice_cat)) %>% 
+  
+  ggplot2::ggplot(data = ., aes(x = scenario, y = practice_cat, group = id, colour = practice_diff)) + 
+  geom_line(position = position_jitter(width = 0.15, height = 0.2, seed = 208), alpha = 0.3) + 
+  geom_point(position = position_jitter(width = 0.15, height = 0.2, seed = 208), alpha = 0.2) + 
+  scale_colour_manual(values = c("#b8002b", "#610017", "#cccccc", "#cfad72", "#c9902c", "black")) + 
+  facet_wrap(~assumption) + 
+  theme_minimal() + 
+  theme(
+    text = element_text(size = 16)
+  )
+```
+
+## Models 
+
+### Raw summaries 
+
+#### Outliers
+
+```{r}
+mod_out_mi_summary <- summary(mod_out_mi)
+
+mod_out_effects_scenario <- conditional_effects(mod_out_mi, "scenario", categorical = T)
+mod_out_effects_level <- conditional_effects(mod_out_mi, "demo_level", categorical = T)
+mod_out_effects_uni <- conditional_effects(mod_out_mi, "uni_rank_cat", categorical = T)
+
+mod_out_mi_summary$fixed[ ,1:4] %>% lazy_kable()
+
+mod_out_effects_scenario
+mod_out_effects_level
+mod_out_effects_uni
+```
+
+#### Influential cases 
+
+##### With random effects (1|id)
+
+```{r}
+mod_inf_mi_re_summary <- summary(mod_inf_mi_re)
+
+mod_inf_re_effects_scenario <- conditional_effects(mod_inf_mi_re, "scenario", categorical = T)
+mod_inf_re_effects_level <- conditional_effects(mod_inf_mi_re, "demo_level", categorical = T)
+mod_inf_re_effects_uni <- conditional_effects(mod_inf_mi_re, "uni_rank_cat", categorical = T)
+
+mod_inf_mi_re_summary$fixed[ ,1:4] %>% lazy_kable()
+
+mod_inf_re_effects_scenario
+mod_inf_re_effects_level
+mod_inf_re_effects_uni
+```
+
+##### No random effects (keep s1 and s2)
+
+```{r}
+mod_inf_mi_summary <- summary(mod_inf_mi)
+
+mod_inf_effects_scenario <- conditional_effects(mod_inf_mi, "scenario", categorical = T)
+mod_inf_effects_level <- conditional_effects(mod_inf_mi, "demo_level", categorical = T)
+mod_inf_effects_uni <- conditional_effects(mod_inf_mi, "uni_rank_cat", categorical = T)
+
+mod_inf_mi_summary$fixed[ ,1:4] %>% lazy_kable()
+
+mod_inf_effects_scenario
+mod_inf_effects_level
+mod_inf_effects_uni
+```
+
+##### s1 only 
+
+```{r}
+mod_inf_mi_s1_summary <- summary(mod_inf_mi_s1)
+mod_inf_mi_s2_summary <- summary(mod_inf_mi_s2)
+
+mod_inf_s1_effects_level <- conditional_effects(mod_inf_mi_s1, "demo_level", categorical = T)
+mod_inf_s1_effects_uni <- conditional_effects(mod_inf_mi_s1, "uni_rank_cat", categorical = T)
+
+mod_inf_mi_s1_summary$fixed[ ,1:4] %>% lazy_kable()
+
+mod_inf_s1_effects_level
+mod_inf_s1_effects_uni
+```
+
+#### Normality
+
+```{r}
+mod_norm_mi_summary <- summary(mod_norm_mi)
+```
+
+#### Heterogeneity 
+
+```{r}
+mod_het_mi_summary <- summary(mod_het_mi)
+```
+
+```{r}
+env$mod_norm_mi_summary <- mod_norm_mi_summary
+env$mod_het_mi_summary <- mod_het_mi_summary
+env$mod_out_mi_summary <- mod_out_mi_summary
+env$mod_inf_mi_s1_summary <- mod_inf_mi_s1_summary
+env$mod_inf_mi_s2_summary <- mod_inf_mi_s2_summary
+```
+
+
+## Overall plots (descriptive)
+
+```{r}
+base_plots_data <- model_data %>% 
+  dplyr::select(
+    id, scenario, cat_norm, cat_het, cat_out, cat_inf
+  ) %>%
+  tidyr::pivot_longer(
+    ., 
+    cols = c(cat_norm:cat_inf), 
+    names_to = "assumption", 
+    values_to = "practice_cat"
+  ) %>%
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                          levels = c("cat_norm", "cat_het", "cat_out", "cat_inf"), 
+                          labels = c("Normality", "Homoscedasticity", "Basic checks and outliers", "Influential cases"))
+  )
+
+base_plots_sum <- base_plots_data %>% 
+  dplyr::group_by(scenario, assumption, practice_cat) %>%
+  dplyr::summarise(
+    n = n()
+  ) %>%
+  dplyr::group_by(scenario, assumption) %>%
+  dplyr::mutate(
+    prop = n/sum(n), 
+    percent = prop * 100)
+```
+
+### Plot set up 
+
+```{r}
+col_main = "#1c4c72"
+col_main_contrast = "#e7a350"
+col_background = "#fee8d1"
+col_gridlines = "#e3d0bc"
+col_text = "#5e5e5e"
+axis_text_size = 12
+axis_title_size = 12
+strip_text_size= 12
+
+col_point_range = col_main
+col_t3 = "#E7C496"
+col_t2 = col_main_contrast
+col_t1 = "#c57c43"
+
+theme_set_up = theme(
+  axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+  axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0)),
+  
+  panel.background = element_rect(colour = col_background, fill = col_background), 
+  plot.background = element_rect(colour = col_background, fill = col_background), 
+  panel.grid.major = element_line(colour = col_gridlines), 
+  panel.grid.minor = element_blank(),
+  
+  strip.background = element_rect(fill = col_main), 
+  strip.text = element_text(face = "bold", size = strip_text_size), 
+  
+  legend.background = element_rect(fill = col_background),
+  legend.text = element_text(colour = col_text),
+  legend.title = element_text(face = "bold", colour = col_text),
+  axis.title = element_text(face = "bold", colour = col_text, size = axis_title_size),
+  axis.text = element_text(colour = col_text, size = axis_text_size),
+  
+  legend.position = "none"
+  
+) 
+```
+
+
+```{r fig.width=6, fig.height=6, warning = FALSE}
+#base_plot_wide <- 
+#base_plot_long <- 
+base_plot_square <- 
+  base_plots_sum %>%
+  ggplot2::ggplot(., aes(x = practice_cat, y = percent, colour = scenario, fill = scenario)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.5) + 
+  facet_wrap(~assumption, nrow = 2) +
+  scale_fill_manual(values = rev(c(col_main, col_main_contrast))) + 
+  scale_colour_manual(values = rev(c(col_main, col_main_contrast))) + 
+  
+  labs(x = "Practice category (1-5)", y = "Percent (%)", colour = "Scenario", fill = "Scenario") + 
+  
+  coord_cartesian(ylim = c(0, 100)) + 
+  scale_y_continuous(breaks = seq(0, 100, 25)) + 
+  
+  theme_light() + 
+  theme_set_up 
+
+base_plot_square
+
+# ggplot2::ggsave(base_plot_wide, filename =  "../figures/base_plot_wide.png",
+#                 width = 12, height = 3.5)
+# 
+# ggplot2::ggsave(base_plot_long, filename =  "../figures/base_plot_long.png",
+#                 width = 3.5, height = 12)
+# 
+# ggplot2::ggsave(base_plot_square, filename =  "../figures/base_plot_square.png",
+#                 width = 6, height = 6)
+  
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Probit model summaries
+
+#### Research level 
+
+(Subtract each effect from the intercepts, then $exp(x) / (1 + exp(x))$ to get cumulative probabilities)
+
+
+```{r}
+get_plot_data_old <- function(model_sum, effect_string, levels, assumption){
+  
+  mod_df <- model_sum$fixed[ , c(1,3,4)] %>% 
+  as.data.frame()
+  
+  #####
+  
+  intercepts <- mod_df[1:2, ]
+  nrow = nrow(mod_df)
+  
+  effects_rev <- mod_df[3:nrow, ] * (-1)
+  effects_t1 <- effects_rev + intercepts[rep(1, times = nrow-2), ]
+  effects_t2 <- effects_rev + intercepts[rep(2, times = nrow-2), ]
+  
+  effects_all <- dplyr::bind_rows(
+    intercepts %>% dplyr::mutate(threshold = c("t1", "t2")) %>% tibble::rownames_to_column(), 
+    effects_t1 %>% dplyr::mutate(threshold = "t1") %>% tibble::rownames_to_column(), 
+    effects_t2 %>% dplyr::mutate(threshold = "t2") %>% tibble::rownames_to_column()
+  ) 
+  
+  
+  if(nrow(effects_all) == 16){order = c(1,2,rep(c(3,4,5,6,7,8,9), 2))}
+  else{order = c(1,2,rep(c(3,4,5,6,7, 8), 2))}
+  
+  effects_all %<>%
+  dplyr::mutate(order = order)
+  
+  effects_all %<>%
+    dplyr::mutate(
+      Estimate = brms::inv_logit_scaled(Estimate), 
+      `l-95% CI` = brms::inv_logit_scaled(`l-95% CI`, ub = Estimate), 
+      `u-95% CI` = brms::inv_logit_scaled(`u-95% CI`, lb = Estimate), 
+    ) %>% 
+    dplyr::arrange(order)
+  
+  # important note on the calculation of the CIs above - at the moment, I'm just using the same inverse logit 
+  # function for all CIs with lower and upper bounds. The CIs for the intercepts however compute correctly
+  # without lower and upper bounds. As in, they match the output from brms::conditional_effects. Basically, 
+  # I need to find the correct way to subtract the estimates from the intercepts in a way that doesn't cause
+  # the point estimate to be outside of the confidence intervals after conversion by inv_logit
+  
+  #####
+  
+  predictor_effects <- effects_all %>% 
+  dplyr::filter(stringr::str_detect(rowname, paste0("Intercept|", effect_string))) %>% 
+    dplyr::arrange(order) 
+  
+  nrow_effects <- nrow(predictor_effects)
+  
+  levels = levels
+  
+  predictor_effects[(nrow_effects+1):(nrow_effects+length(levels)), ] <- NA
+  
+  predictor_effects %<>% 
+    dplyr::mutate(
+      rowname = c(rep(levels, each = 2), levels),
+      threshold = c(threshold[1:nrow_effects], rep("t3", length(levels))), 
+      Estimate = c(Estimate[1:nrow_effects], rep(1, length(levels))) * 100,
+      `l-95% CI` = `l-95% CI` * 100,
+      `u-95% CI` = `u-95% CI` * 100
+    ) %>% 
+     dplyr::arrange(rowname) %>% 
+    dplyr::group_by(rowname) %>%
+    dplyr::mutate(
+      plot_estimate = Estimate - lag(Estimate),
+      plot_estimate = if_else(is.na(plot_estimate), Estimate, plot_estimate), 
+      rowname = factor(rowname, levels = levels),
+      assumption = assumption
+    )
+  
+}
+```
+
+
+```{r}
+plot_data_level_1 <- get_plot_data(model = mod_norm_mi, effect_string = "demo_level", 
+                                   levels = c("Teach", "Faculty", "Postdoc", "PhD"), 
+                                   assumption = "Normality")
+
+plot_data_level_2 <- get_plot_data(model = mod_het_mi, effect_string = "demo_level", 
+                                   levels = c("Teach", "Faculty", "Postdoc", "PhD"), 
+                                   assumption = "Homoscedasticity")
+
+plot_data_level_3 <- get_plot_data(model = mod_out_mi, effect_string = "demo_level", 
+                                   levels = c("Teach", "Faculty", "Postdoc", "PhD"), 
+                                   assumption = "Basic checks and outliers")
+
+plot_data_level_4 <- get_plot_data(model = mod_inf_mi_s1, effect_string = "demo_level", 
+                                   levels = c("Teach", "Faculty", "Postdoc", "PhD"), 
+                                   assumption = "Influential cases (experimental)")
+
+plot_data_level_5 <- get_plot_data(model = mod_inf_mi_s2, effect_string = "demo_level", 
+                                   levels = c("Teach", "Faculty", "Postdoc", "PhD"), 
+                                   assumption = "Influential cases (cross-sectional)")
+
+plot_data_level_merged <- 
+  dplyr::bind_rows(
+    plot_data_level_1, 
+    plot_data_level_2, 
+    plot_data_level_3, 
+    plot_data_level_4, 
+    plot_data_level_5
+  ) %>%
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        levels = c("Normality", "Homoscedasticity", "Basic checks and outliers", "Influential cases (experimental)", "Influential cases (cross-sectional)")), 
+    rowname = factor(rowname, 
+                     levels = c("Teach", "Faculty", "Postdoc", "PhD"),
+                     labels = c("Methods \ninstructors", "Faculty", "Postdocs", "PhDs")), 
+    threshold = factor(threshold, 
+                       levels = c("t3", "t2", "t1"),
+                       labels = c("\nCorrect checks are performed \n \n", 
+                                  "Some checks are performed \nbut they are insufficient \nto detect problems\n", 
+                                  "No action taken / \nno checks are performed")
+                      )
+  )
+
+plot_data_level_merged
+```
+
+
+
+
+```{r fig.width=12, fig.height=3.5}
+col_point_range = col_main
+col_t3 = "#E7C496"
+col_t2 = col_main_contrast
+col_t1 = "#c57c43"
+
+dodge_width = -0.8
+error_bar_width = 0.2
+
+#e7a350
+
+plot_data = plot_data_level_merged
+
+level_plot_wide <- 
+#level_plot_long <- 
+#level_plot_square <- 
+  ggplot2::ggplot(data = plot_data, aes(x = rowname, 
+                                      fill = threshold, 
+                                      y = plot_estimate)) + 
+  geom_bar(stat = "identity",
+           width = 0.3, size = 0.01) + 
+  
+  geom_point(data = plot_data %>% 
+               dplyr::filter(threshold != levels(plot_data$threshold)[1]), 
+             aes(x = rowname, y = Estimate), 
+             colour = col_point_range, 
+             position = position_dodge(width = dodge_width), 
+             show.legend = FALSE, 
+             
+  ) + 
+    geom_errorbar(data = plot_data %>% 
+                    dplyr::filter(threshold != levels(plot_data$threshold)[1]),
+                  aes(x = rowname, ymin = `l-95% CI`, ymax = `u-95% CI`),
+                  colour = col_point_range,
+                  width = error_bar_width,
+                  position = position_dodge(width = dodge_width)
+                  ) +
+    
+    scale_fill_manual(values = c(col_t3, col_t2, col_t1)) + 
+    
+    labs(x = "Academic research level", y = "Cumulative percent (%)", fill = "Practice quality") + 
+    facet_wrap(~assumption, ncol = 4) + 
+    theme_light() +
+    theme_set_up + 
+    theme(
+      legend.spacing.y = unit(.5, "cm"), 
+      legend.key = element_rect(size = 10, colour = col_background, fill = col_background),
+      legend.key.size = unit(1, "cm"),
+      axis.text.x = element_text(angle = 0, colour = col_text, size = 11.5), 
+      panel.grid.minor = element_line(colour = col_gridlines)
+    )
+
+level_plot_wide
+
+# 
+# ggplot2::ggsave(level_plot_wide, filename =  "../figures/level_plot_wide.png",
+#                 width = 12, height = 3.5)
+#  
+# ggplot2::ggsave(level_plot_long, filename =  "../figures/level_plot_long.png",
+#                 width = 3.5, height = 12)
+# 
+# ggplot2::ggsave(level_plot_square, filename =  "../figures/level_plot_square.png",
+#                 width = 6, height = 6)
+  
+
+```
+
+
+#### scenario
+
+```{r}
+plot_data_scenario_1 <- get_plot_data(model = mod_norm_mi, effect_string = "scenario", 
+                                   levels = c("s1", "s2"), 
+                                   assumption = "Normality")
+
+plot_data_scenario_2 <- get_plot_data(model = mod_het_mi, effect_string = "scenario", 
+                                   levels = c("s1", "s2"), 
+                                   assumption = "Homoscedasticity")
+
+plot_data_scenario_3 <- get_plot_data(model = mod_out_mi, effect_string = "scenario", 
+                                   levels = c("s1", "s2"), 
+                                   assumption = "Basic checks and outliers")
+
+plot_data_scenario_4 <- get_plot_data(model = mod_inf_mi_s1, effect_string = "scenario", 
+                                   levels = c("s1"), 
+                                   assumption = "Influential cases (experimental)")
+
+plot_data_scenario_5 <- get_plot_data(model = mod_inf_mi_s2, effect_string = "scenario", 
+                                   levels = c("s2"), 
+                                   assumption = "Influential cases (cross-sectional)")
+
+plot_data_scenario_merged <- 
+  dplyr::bind_rows(
+    plot_data_scenario_1, 
+    plot_data_scenario_2, 
+    plot_data_scenario_3, 
+    plot_data_scenario_4,
+    plot_data_scenario_5
+  ) %>%
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        levels = c("Normality", "Homoscedasticity", "Basic checks and outliers", "Influential cases (experimental)", "Influential cases (cross-sectional)")), 
+    rowname = factor(rowname, 
+                     levels = c("s1", "s2"),
+                     labels = c(" Experimental \nscenario", " Cross-sectional \nscenario")), 
+    threshold = factor(threshold, 
+                       levels = c("t3", "t2", "t1"),
+                       labels = c("\nCorrect checks are performed \n \n", 
+                                  "Some checks are performed \nbut they are insufficient \nto detect problems\n", 
+                                  "No action taken / \nno checks are performed")
+                      )
+  )
+```
+
+
+#### University rank
+
+```{r}
+plot_data_rank_1 <- get_plot_data(model = mod_norm_mi, effect_string = "uni_rank", 
+                                   levels = c("1", "2", "3", "4"), 
+                                   assumption = "Normality")
+
+plot_data_rank_2 <- get_plot_data(model = mod_het_mi, effect_string = "uni_rank", 
+                                   levels = c("1", "2", "3", "4"), 
+                                   assumption = "Homoscedasticity")
+
+plot_data_rank_3 <- get_plot_data(model = mod_out_mi, effect_string = "uni_rank", 
+                                   levels = c("1", "2", "3", "4"), 
+                                   assumption = "Basic checks and outliers")
+
+plot_data_rank_4 <- get_plot_data(model = mod_inf_mi_s1, effect_string = "uni_rank", 
+                                   levels = c("1", "2", "3", "4"), 
+                                   assumption = "Influential cases (experimental)")
+plot_data_rank_5 <- get_plot_data(model = mod_inf_mi_s2, effect_string = "uni_rank", 
+                                   levels = c("1", "2", "3", "4"), 
+                                   assumption = "Influential cases (cross-sectional)")
+
+plot_data_rank_merged <- 
+  dplyr::bind_rows(
+    plot_data_rank_1, 
+    plot_data_rank_2, 
+    plot_data_rank_3, 
+    plot_data_rank_4, 
+    plot_data_rank_5
+  ) %>%
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        levels = c("Normality", "Homoscedasticity", "Basic checks and outliers", "Influential cases (experimental)", "Influential cases (cross-sectional)")), 
+    rowname = factor(rowname, 
+                     levels = c("1", "2", "3", "4"),
+                     labels = c(" 1-\n200", " 201-\n500", "  501-\n1000", "Not \nranked")), 
+    threshold = factor(threshold, 
+                       levels = c("t3", "t2", "t1"),
+                       labels = c("\nCorrect checks are performed \n \n", 
+                                  "Some checks are performed \nbut they are insufficient \nto detect problems\n", 
+                                  "No action taken / \nno checks are performed")
+                      )
+  )
+
+plot_data_rank_merged
+```
+
+```{r}
+env$plot_data_level_merged <- plot_data_level_merged
+env$plot_data_scenario_merged <- plot_data_scenario_merged
+env$plot_data_rank_merged <- plot_data_rank_merged
+```
+
+
+
+```{r fig.width=12, fig.height=3.5}
+
+dodge_width = -0.8
+error_bar_width = 0.2
+
+#e7a350
+
+plot_data = plot_data_rank_merged
+
+rank_plot_wide <- 
+#rank_plot_long <- 
+#rank_plot_square <- 
+  ggplot2::ggplot(data = plot_data, aes(x = rowname, 
+                                      fill = threshold, 
+                                      y = plot_estimate)) + 
+  geom_bar(stat = "identity",
+           width = 0.3, size = 0.01) + 
+  
+  geom_point(data = plot_data %>% 
+               dplyr::filter(threshold != levels(plot_data$threshold)[1]), 
+             aes(x = rowname, y = Estimate), 
+             colour = col_point_range, 
+             position = position_dodge(width = dodge_width), 
+             show.legend = FALSE, 
+             
+  ) + 
+  geom_errorbar(data = plot_data %>% 
+               dplyr::filter(threshold != levels(plot_data$threshold)[1]),
+               aes(x = rowname, ymin = `l-95% CI`, ymax = `u-95% CI`),
+                colour = col_point_range,
+                width = error_bar_width,
+                position = position_dodge(width = dodge_width)) +
+  
+  scale_fill_manual(values = c(col_t3, col_t2, col_t1)) + 
+  
+  labs(x = "World rank (Times HE)", y = "Cumulative percent (%)", fill = "Practice quality") + 
+  facet_wrap(~assumption, ncol = 4) + 
+  theme_light() +
+  theme_set_up + 
+  theme(
+     legend.spacing.y = unit(.5, "cm"), 
+     legend.key = element_rect(size = 10, colour = col_background, fill = col_background),
+     legend.key.size = unit(1, "cm"),
+     axis.text.x = element_text(colour = col_text), 
+    panel.grid.minor = element_line(colour = col_gridlines))
+
+
+ggplot2::ggsave(rank_plot_wide, filename =  "../figures/rank_plot_wide.png",
+                width = 12, height = 3.5)
+#  
+# ggplot2::ggsave(rank_plot_long, filename =  "../figures/rank_plot_long.png",
+#                 width = 3.5, height = 12)
+# 
+# ggplot2::ggsave(rank_plot_square, filename =  "../figures/rank_plot_square.png",
+#                 width = 6, height = 6)
+
+```
+
+
+```{r}
+env$posterior_df_norm <- as.data.frame(mod_norm_mi) %>% HDInterval::hdi()
+env$posterior_df_het <- as.data.frame(mod_het_mi) %>% HDInterval::hdi()
+env$posterior_df_out <- as.data.frame(mod_out_mi) %>% HDInterval::hdi()
+env$posterior_df_inf_s1 <- as.data.frame(mod_inf_mi_s1) %>% HDInterval::hdi()
+env$posterior_df_inf_s2 <- as.data.frame(mod_inf_mi_s2) %>% HDInterval::hdi()
+```
+
+
+### Discrete probabilities 
+
+
+
+```{r}
+mod_norm_mi_conditional_probs <- conditional_probs(mod_norm_mi, "Normality")
+mod_het_mi_conditional_probs <- conditional_probs(mod_het_mi, "Homoscedasticity")
+mod_out_mi_conditional_probs <- conditional_probs(mod_out_mi, "Basic checks and outliers")
+mod_inf_mi_conditional_probs <- conditional_probs_inf(mod_inf_mi_s1, mod_inf_mi_s2, "Influential cases")
+```
+
+
+```{r}
+env$mod_norm_mi_conditional_probs <- mod_norm_mi_conditional_probs
+env$mod_het_mi_conditional_probs <- mod_het_mi_conditional_probs
+env$mod_out_mi_conditional_probs <- mod_out_mi_conditional_probs
+env$mod_inf_mi_conditional_probs <- mod_inf_mi_conditional_probs
+```
+
+
+# Model plots 
+
+scenario
+
+```{r}
+scenario_model_data <- 
+  rbind.data.frame(
+    mod_norm_mi_conditional_probs[[1]], 
+    mod_het_mi_conditional_probs[[1]], 
+    mod_out_mi_conditional_probs[[1]], 
+    mod_inf_mi_conditional_probs[[1]]
+    
+  )
+
+scenario_model_data %>% 
+  ggplot2::ggplot(., aes(y = estimate, x = .category, colour = scenario)) + 
+  geom_point(position = position_dodge(width = 0.4)) + 
+  geom_errorbar(
+    aes(ymin = lower_hpd, ymax = upper_hpd), 
+    position = position_dodge(width = 0.4), 
+    width = 0.2) + 
+  facet_wrap(~assumption)
+```
+
+demo_level
+
+```{r}
+demo_level_model_data <- 
+  rbind.data.frame(
+    mod_norm_mi_conditional_probs[[2]], 
+    mod_het_mi_conditional_probs[[2]], 
+    mod_out_mi_conditional_probs[[2]], 
+    mod_inf_mi_conditional_probs[[2]]
+    
+  )
+
+demo_level_model_data %>% 
+  ggplot2::ggplot(., aes(y = estimate, x = .category, colour = demo_level)) + 
+  geom_point(position = position_dodge(width = 0.4)) + 
+  geom_errorbar(
+    aes(ymin = lower_hpd, ymax = upper_hpd), 
+    position = position_dodge(width = 0.4), 
+    width = 0.2) + 
+  facet_wrap(~assumption)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#env <- readRDS("../objects/env.rds")
+```
+
+
+
+```{r}
+saveRDS(env, "../objects/env_220322.rds")
+```
+
+
+
+## HPD intervals 
+
+Extract posterior draws
+
+```{r}
+mod_inf_post_df <-  as.data.frame(mod_inf_mi_s1)
+
+mod_inf_post_df
+
+summary(mod_inf_mi_s1)
+```
+
+```{r}
+ggplot2::ggplot(mod_inf_post_df) + 
+  geom_density(aes(x = (`b_Intercept[1]`) %>% exp_c()), colour = "blue") + 
+  geom_density(aes(x = ((`b_demo_levelFaculty`*(-1)) + `b_Intercept[1]`) %>% exp_c()), colour = "green")
+```
+
+```{r}
+HDInterval::hdi(mod_inf_post_df$`b_Intercept[1]`, .95)
+```
+
+```{r}
+mod_inf_post_df %<>%
+  dplyr::mutate(
+    prob_c_intercept_1 = brms::inv_logit_scaled(`b_Intercept[1]`)
+  )
+
+```
+
+Ammend `get_plot_data` 
+
+```{r}
+get_plot_data <- function(model, effect_string, levels, assumption){
+#
+# model = mod_out_mi
+# effect_string = "demo_level"
+# levels = c("Teach", "Faculty", "Postdoc", "PhD")
+# assumption = "Influential cases"
+
+  model_sum <- summary(model)
+  
+  mod_df <- model_sum$fixed[ , 1:2] %>% 
+  as.data.frame()
+  
+  #####
+  
+  intercepts <- mod_df[1:2, ]
+  nrow = nrow(mod_df)
+  
+  effects_rev <- mod_df[3:nrow, ] * (-1)
+  effects_t1 <- effects_rev + intercepts[rep(1, times = nrow-2), ]
+  effects_t2 <- effects_rev + intercepts[rep(2, times = nrow-2), ]
+  
+  effects_all <- dplyr::bind_rows(
+    intercepts %>% dplyr::mutate(threshold = c("t1", "t2")) %>% tibble::rownames_to_column(), 
+    effects_t1 %>% dplyr::mutate(threshold = "t1") %>% tibble::rownames_to_column(), 
+    effects_t2 %>% dplyr::mutate(threshold = "t2") %>% tibble::rownames_to_column()
+  ) 
+  
+  #### prepare for plots ####
+  
+  if(nrow(effects_all) == 16){order = c(1,2,rep(c(3,4,5,6,7,8,9), 2))}
+  else{order = c(1,2,rep(c(3,4,5,6,7, 8), 2))}
+
+  # order = c(1,2,rep(c(3,4,5,6,7,8,9), 2))
+  # order = c(1,2,rep(c(3,4,5,6,7, 8), 2))
+  
+  effects_all %<>%
+  dplyr::mutate(order = order)
+  
+  ##### get proper HPD intervals 
+
+  model_post_df <- as.data.frame(model)
+  
+  # subtract each effect from intercepts 
+  
+  effect_names <- names(model_post_df)[stringr::str_detect(names(model_post_df), "scenario|demo_level|uni_rank")]
+  
+  # next - inverse and do plus intercept using across 
+  
+  rev_vals <- function(x){x*(-1)}
+  
+  hpd_t1 <- model_post_df %>% 
+    dplyr::mutate(
+      across(.cols = all_of(effect_names),
+             .fns = rev_vals), 
+      across(.cols = all_of(effect_names), 
+             .fns = ~.x + `b_Intercept[1]`), 
+      across(.cols = c("b_Intercept[1]", all_of(effect_names)), 
+             .fns = exp_c)
+    ) %>%
+    dplyr::select(-c(`b_Intercept[2]`, disc, lp__)) %>%
+    HDInterval::hdi(credMass = .95) %>% 
+    t() %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column() %>%
+    dplyr::mutate(
+      threshold = "t1", 
+      rowname = stringr::str_remove_all(rowname, pattern = "b_")
+    )
+  
+  hpd_t2 <- model_post_df %>% 
+    dplyr::mutate(
+      across(.cols = all_of(effect_names),
+             .fns = rev_vals), 
+      across(.cols = all_of(effect_names), 
+             .fns = ~.x + `b_Intercept[2]`), 
+      across(.cols = c("b_Intercept[2]", all_of(effect_names)), 
+             .fns = exp_c)
+    ) %>%
+    dplyr::select(-c(`b_Intercept[1]`, disc, lp__)) %>%
+    HDInterval::hdi(credMass = .95) %>% 
+    t() %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column() %>%
+    dplyr::mutate(
+      threshold = "t2", 
+      rowname = stringr::str_remove_all(rowname, pattern = "b_")
+    )
+    
+  hpd_df <- dplyr::full_join(hpd_t1, hpd_t2, by = c("rowname", "lower", "upper", "threshold")) %>%
+    dplyr::filter(rowname %in% effects_all$rowname)
+  
+  effects_all %<>% dplyr::full_join(., hpd_df, c("rowname", "threshold"))
+  
+  effects_all %<>%
+    dplyr::mutate(
+      Estimate = brms::inv_logit_scaled(Estimate), 
+      `l-95% CI` = lower, 
+      `u-95% CI` = upper, 
+    ) %>% 
+    dplyr::arrange(order)
+  
+  effects_all
+  
+  #####
+  
+  predictor_effects <- effects_all %>% 
+  dplyr::filter(stringr::str_detect(rowname, paste0("Intercept|", effect_string))) %>% 
+    dplyr::arrange(order) 
+  
+  nrow_effects <- nrow(predictor_effects)
+  
+  levels = levels
+  
+  predictor_effects[(nrow_effects+1):(nrow_effects+length(levels)), ] <- NA
+  
+  predictor_effects %<>% 
+    dplyr::mutate(
+      rowname = c(rep(levels, each = 2), levels),
+      threshold = c(threshold[1:nrow_effects], rep("t3", length(levels))), 
+      Estimate = c(Estimate[1:nrow_effects], rep(1, length(levels))) * 100,
+      `l-95% CI` = `l-95% CI` * 100,
+      `u-95% CI` = `u-95% CI` * 100
+    ) %>% 
+     dplyr::arrange(rowname) %>% 
+    dplyr::group_by(rowname) %>%
+    dplyr::mutate(
+      plot_estimate = Estimate - lag(Estimate),
+      plot_estimate = if_else(is.na(plot_estimate), Estimate, plot_estimate), 
+      rowname = factor(rowname, levels = levels),
+      assumption = assumption
+    )
+  
+  
+  
+}
+```
+

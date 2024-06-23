@@ -1,0 +1,679 @@
+---
+title: "Data analysis: multiple imputation"
+author: "MS"
+date: "06/09/2021"
+output: html_document
+---
+
+IMPORTANT: The original dataset collected information about university name which was then paired with a world rank. Both of these variables could be used to identify participants at institutions which, at the time, did not tie on ranks with any other institutions. Because of this, the variables were removed from the dataset. 
+
+The variable `world_rank` was replaced with a randomly generated variable that correlated with the original rank with r = 0.9. Therefore the code below will still be able to run, however please note that any computations that use `world_rank` will not be exactly reproducible. 
+
+The main analysis in the file `analysis_models.Rmd` uses the actual data that was used to fit the models reported in the manuscript. The statistical models used a categorical version of the variable (`world_rank` split into 4 levels), which doesn't pose risk of de-identification and was therefore retained. Basically, the statistical models `analysis_models.Rmd` can be reproduced exactly, but not the imputation. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(mice)
+
+data <- readRDS("../data/processed_data/analysis_exercise_processed_data_2021_10_07_world_rank_de-identified.csv")
+```
+
+## Data prep
+
+Remove unnecessary columns:
+
+```{r}
+data %<>% 
+  dplyr::select(
+    -c(coder, model_notes, model_spec,
+       #plot,
+       plot_notes,
+       outliers_check, out_notes, out_n_notes, out_justify_notes,
+       inf_check_notes, inf_check, inf_n_notes, inf_address_notes, as_justify_inf_4_TEXT, justify_notes,
+       as_mention,
+       norm_check_notes, norm_address_notes, norm_justify_notes,
+       het_check, het_as_check_h_6_TEXT, as_address_h,
+       as_address_h_4_TEXT, as_address_h_9_TEXT, as_address_h_10_TEXT, het_notes,
+       lin_check, lin_check_notes, lin_address_notes, lin_justify_notes,
+       contains("software")
+       )
+  )
+
+```
+
+
+```{r}
+ordered_factor <- function(x){
+  x = if_else(x %in% c(3,4,5), 3, as.double(x))
+  return(x)
+  }
+```
+
+
+
+Remove cases that are not going to included in the models and only summarised descriptively: 
+
+- Forensic psychologists
+- Industry scientists 
+- Postgraduate taught students (these should not have participated in the first place but somehow slipped through). 
+
+```{r}
+model_data <- data %>% 
+  dplyr::filter(ri_subfield != "Forensic psychology" | is.na(ri_subfield), 
+                demo_level != "Postgraduate taught student" | is.na(demo_level), 
+                world_rank != -999 | is.na(world_rank)) %>% 
+  dplyr::mutate(
+    demo_level = droplevels(demo_level), 
+    ri_subfield = droplevels(ri_subfield)
+  )
+```
+
+Convert into wide format
+
+```{r}
+id_cols <-  model_data %>% 
+  dplyr::select("id", "world_rank", "rank_cat",  "ri_subfield", "ri_preferred_ht", 
+                "demo_level", "ri_teach") %>% 
+  names()
+
+model_data_wide <- model_data %>% 
+  tidyr::pivot_wider(
+    id_cols = all_of(id_cols),
+    names_from = "scenario", 
+    names_glue = "{scenario}_{.value}",
+    values_from = c(model:lin_justify, cat_norm:cat_inf)
+  ) 
+
+model_data_wide$ri_teach %>% levels()
+```
+
+check counts
+
+scenario:
+
+```{r}
+model_data %>% 
+  dplyr::select(cat_norm:cat_inf) %>%
+  tidyr::pivot_longer(
+    cols = cat_norm:cat_inf, 
+    values_to = "cat", 
+    names_to = "assumption"
+  ) %>% 
+  dplyr::group_by(assumption, cat) %>%
+  dplyr::summarise(n = n()) %>% View()
+```
+
+
+```{r}
+model_data %>% 
+  dplyr::select(scenario, cat_norm:cat_inf) %>%
+  tidyr::pivot_longer(
+    cols = cat_norm:cat_inf, 
+    values_to = "cat", 
+    names_to = "assumption"
+  ) %>% 
+  dplyr::group_by(assumption, scenario, cat) %>%
+  dplyr::summarise(n = n()) %>% View()
+```
+
+research level:
+
+```{r}
+model_data %>% 
+  dplyr::select(demo_level, cat_norm:cat_inf) %>%
+  tidyr::pivot_longer(
+    cols = cat_norm:cat_inf, 
+    values_to = "cat", 
+    names_to = "assumption"
+  ) %>% 
+  dplyr::group_by(assumption, demo_level, cat) %>%
+  dplyr::summarise(n = n()) %>% View()
+```
+
+uni rank: 
+
+```{r}
+model_data %>% 
+  dplyr::select(rank_cat, cat_norm:cat_inf) %>%
+  tidyr::pivot_longer(
+    cols = cat_norm:cat_inf, 
+    values_to = "cat", 
+    names_to = "assumption"
+  ) %>% 
+  dplyr::group_by(assumption, rank_cat, cat) %>%
+  dplyr::summarise(n = n()) %>% View()
+```
+
+## Multiple imputation 
+
+
+### Predictor matrix 
+
+Use `quickpred()` function to get initial matrix
+
+```{r}
+index <- function(pred_matrix_df, var_name){
+  index = which(colnames(pred_matrix_df) == var_name)
+  return(index)
+}
+```
+
+
+```{r}
+default_cor <- 0.20
+n_var = ncol(model_data_wide)
+mincor = c(rep(default_cor, times = n_var))
+```
+
+
+```{r}
+pred <- mice::quickpred(data = model_data_wide, 
+                        mincor = mincor, 
+                        minpuc = 0,
+                        method = "spearman" , 
+                        exclude = "id"
+                        ) 
+
+pred_df <- pred %>% as.data.frame()
+```
+
+
+Amend predictor matrix based on preregistered rules
+
+1. Remove cross-assumption predictions 
+
+- function works on "squares" located within the matrix. Select where a square starts and where it finishes. Square needs to be defined specifically for each section 
+
+
+```{r}
+batch_adjust_matrix <- function(predictor_matrix_df, 
+                                dplyr_select_query_row, 
+                                dplyr_select_query_col,
+                                assign = 0){
+  
+  # process rows
+  selected_var_names_list_row = NULL
+  for(i in 1:length(dplyr_select_query_row)){
+    
+    selected_var_names_list_row_i <- predictor_matrix_df %>% 
+      dplyr::select(eval(parse(text = dplyr_select_query_row[[i]]))) %>% 
+      names()
+    
+    selected_var_names_list_row[[i]] = selected_var_names_list_row_i
+  }
+  selected_var_names_row <- unlist(selected_var_names_list_row)
+  selected_var_names_row <- selected_var_names_row[!duplicated(selected_var_names_row)]
+  
+  # process col
+  selected_var_names_list_col = NULL
+  for(i in 1:length(dplyr_select_query_col)){
+    
+    selected_var_names_list_col_i <- predictor_matrix_df %>% 
+      dplyr::select(eval(parse(text = dplyr_select_query_col[[i]]))) %>% 
+      names()
+    
+    selected_var_names_list_col[[i]] = selected_var_names_list_col_i
+  }
+  selected_var_names_col <- unlist(selected_var_names_list_col)
+  selected_var_names_col <- selected_var_names_col[!duplicated(selected_var_names_col)]
+  
+  new_predictor_matrix <- predictor_matrix_df
+  new_predictor_matrix[selected_var_names_row, selected_var_names_col] <- assign
+  
+  return(new_predictor_matrix)
+  
+}
+
+# I wrote this monstrocity of a function when I was pretty tired and stressed out. 
+# One sleep later (a few lines down) there's a much simpler one-line function that can probably 
+# deal with the issue in a more elegant way. But I've already put too much time effort and tears 
+# into this one, so it's staying in the script goddamnit don't judge me. 
+```
+
+
+```{r}
+# as ~ assumption_string
+as <- c(
+  "contains('plot')", # 1
+  "contains('out')",  # 2 
+  "contains('inf')",  # 3
+  "contains('norm')", # 4
+  "contains('het')",  # 5
+  "contains('lin')"   # 6
+)
+
+```
+
+
+```{r}
+# outliers shouldn't predict other categories: 
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_col = list(as[2]),
+                                    dplyr_select_query_row = list(as[3], as[4], as[5], as[6]),
+                                    assign = 0) 
+
+# outliers should not be predicted by other categories (swap _row and _col args):
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_row = list(as[2]),
+                                    dplyr_select_query_col = list(as[3], as[4], as[5], as[6]),
+                                    assign = 0)
+
+# influential cases shouldn't predict other categories: 
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_col = list(as[3]),
+                                    dplyr_select_query_row = list(as[2], as[4], as[5], as[6]),
+                                    assign = 0) 
+
+# influential cases should not be predicted by other categories (swap _row and _col args):
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_row = list(as[3]),
+                                    dplyr_select_query_col = list(as[2], as[4], as[5], as[6]),
+                                    assign = 0) 
+
+# normality shouldn't predict other categories: 
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_col = list(as[4]),
+                                    dplyr_select_query_row = list(as[2], as[3], as[5], as[6]),
+                                    assign = 0) 
+
+# normality should not be predicted by other categories (swap _row and _col args):
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_row = list(as[4]),
+                                    dplyr_select_query_col = list(as[2], as[3], as[5], as[6]),
+                                    assign = 0) 
+
+# het shouldn't predict other categories: 
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_col = list(as[5]),
+                                    dplyr_select_query_row = list(as[2], as[3], as[4], as[6]),
+                                    assign = 0) 
+
+# het should not be predicted by other categories (swap _row and _col args):
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_row = list(as[5]),
+                                    dplyr_select_query_col = list(as[2], as[3], as[4], as[6]),
+                                    assign = 0) 
+
+# linearity shouldn't predict other categories: 
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_col = list(as[6]),
+                                    dplyr_select_query_row = list(as[2], as[3], as[4], as[5]),
+                                    assign = 0) 
+
+# linearity should not be predicted by other categories (swap _row and _col args):
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                                    dplyr_select_query_row = list(as[6]),
+                                    dplyr_select_query_col = list(as[2], as[3], as[4], as[5]),
+                                    assign = 0) 
+```
+
+2. Add key model variables predictions 
+
+world_rank, demo_level and ri_teach should predict outcomes
+
+```{r}
+pred_df[index(pred_df, "s1_cat_norm"):index(pred_df, "s2_cat_inf") ,
+        c("world_rank", "rank_cat", "demo_level", "ri_teach")] <- 1
+```
+
+
+
+#### Additional adjustments
+
+assumption categories should be predicted from relevant assumption items
+
+```{r}
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('cat_out')"), 
+                               dplyr_select_query_col = list("contains('out')"), 
+                               assign = 1
+)
+
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('cat_inf')"), 
+                               dplyr_select_query_col = list("contains('inf')"), 
+                               assign = 1
+)
+
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('cat_norm')"), 
+                               dplyr_select_query_col = list("contains('norm')"), 
+                               assign = 1
+)
+
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('cat_het')"), 
+                               dplyr_select_query_col = list("contains('het')"), 
+                               assign = 1
+)
+```
+
+
+full within assumption prediction
+
+```{r}
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('out')"), 
+                               dplyr_select_query_col = list("contains('out')"), 
+                               assign = 1
+)
+
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df,
+                               dplyr_select_query_row = list("contains('inf')"),
+                               dplyr_select_query_col = list("contains('inf')"),
+                               assign = 1
+)
+
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('norm')"), 
+                               dplyr_select_query_col = list("contains('norm')"), 
+                               assign = 1
+)
+
+pred_df <- batch_adjust_matrix(predictor_matrix_df = pred_df, 
+                               dplyr_select_query_row = list("contains('het')"), 
+                               dplyr_select_query_col = list("contains('het')"), 
+                               assign = 1
+)
+```
+
+ID should not predict anything
+
+```{r}
+pred_df[ ,"id"] <- 0
+```
+
+Variables should not predict self:
+
+```{r}
+for(i in 1:ncol(pred_df)) pred_df[i, i] <- 0
+```
+
+
+### Imputation method
+
+```{r}
+pred_method <- c("", rep("pmm", times = (ncol(pred_df)-1)))
+```
+
+### Fit imputation model
+
+
+```{r}
+pred_df[ ,"id"] <- 0
+pred_df["id",] <- 0
+for(i in 1:ncol(pred_df)) pred_df[i, i] <- 0
+
+pred_matrix <- pred_df %>% as.matrix()
+
+set.seed(1)
+
+imputed_data <- mice::mice(data = model_data_wide, 
+                           m = 58,
+                           method = pred_method, 
+                           predictorMatrix = pred_matrix, 
+                           visitSequence = "revmonotone",
+                           printFlag = FALSE)
+
+```
+
+```{r}
+#saveRDS(imputed_data, "../objects/imputed_data_100421.rds") 
+```
+
+### Diagnostic plots 
+
+
+#### World rank - numeric
+
+```{r}
+mice::densityplot(x = imputed_data, data = ~world_rank)
+```
+
+#### Level
+
+```{r}
+mice::densityplot(x = imputed_data, data = ~demo_level)
+```
+
+#### Outlier practice
+
+```{r}
+mice::densityplot(imputed_data, data = ~s1_cat_out)
+mice::densityplot(imputed_data, data = ~s2_cat_out)
+```
+
+#### Influential cases practice
+
+```{r}
+mice::densityplot(imputed_data, data = ~s1_cat_inf)
+mice::densityplot(imputed_data, data = ~s2_cat_inf)
+```
+
+#### Normality practice
+
+```{r}
+mice::densityplot(imputed_data, data = ~s1_cat_norm)
+mice::densityplot(imputed_data, data = ~s2_cat_norm)
+```
+
+#### Heteroscedasticity practice 
+
+```{r}
+mice::densityplot(imputed_data, data = ~s1_cat_het)
+mice::densityplot(imputed_data, data = ~s2_cat_het)
+```
+
+fmi: 
+
+```{r}
+imputed_data_long <- mice::complete(imputed_data, "long", include = TRUE)
+
+imputed_data_s1 <- imputed_data_long %>%
+  dplyr::select(.imp:ri_teach, contains("s1")) %>% 
+  dplyr::mutate(scenario = "s1")
+
+
+imputed_data_s2 <- imputed_data_long %>%
+  dplyr::select(.imp:ri_teach, contains("s2")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(imputed_data_s1) <- stringr::str_remove_all(pattern = "s1_", string = names(imputed_data_s1))
+names(imputed_data_s2) <- stringr::str_remove_all(pattern = "s2_", string = names(imputed_data_s2))
+
+imp_data_long <- rbind.data.frame(imputed_data_s1, imputed_data_s2)
+
+imp_data_long %<>%
+  dplyr::mutate(
+    across(
+      .cols = cat_norm:cat_inf,
+      .fns = ordered_factor
+    ), 
+    # uni_rank_cat = case_when(
+    #   world_rank == 2000 ~ 4, 
+    #   world_rank %in% c(501:1001) ~ 3,
+    #   world_rank %in% c(201:500) ~ 2,
+    #   world_rank %in% c(1:200) ~ 1
+    # ) %>% factor(), 
+    row_names = rownames(.)
+  ) %>%
+  dplyr::group_by(.imp) %>%
+  dplyr::mutate(.id = 1:max(row_number())) %>% 
+  dplyr::ungroup() 
+
+imp_data_list <- split(imp_data_long, f = imp_data_long$.imp)
+
+
+
+m = length(imp_data_list)-1
+
+q = c()
+for(i in 2:m){
+  q = c(q, median(imp_data_list[[i]]$world_rank))
+}
+
+Vb = sum((q - mean(q))^2) / (m - 1)
+
+Ubi = c()
+for(i in 2:m){
+  Ubi = c(Ubi, var(imp_data_list[[i]]$world_rank))
+}
+
+Ub = sum(Ubi) / m
+
+Vt = Ub + Vb + Vb/m
+
+r = ((1 + 1/m) * Vb) / Ub
+
+n = nrow(imp_data_list[[1]])
+
+fmi_inf = (Vb + Vb/m) / Vt # fmi formula assuming infinite imputations
+
+v = (m - 1)*(1/fmi_inf) # degrees of freedom for fmi adjustment
+  
+fmi = (Vb + Vb/m + 2/(v + 3)) / Vt
+
+fmi/0.01 * 100
+
+fmi/m 
+
+fmi/m <= 0.01
+
+```
+
+Check predictors for successful imputation models: 
+
+```{r}
+which_predictors <- function(pred_df, outcome){
+  pred_df[outcome, ] %>% 
+    t() %>%
+    as.data.frame() %>%
+    dplyr::filter(get(outcome) == 1) %>% 
+    tibble::rownames_to_column(., var = "pred")
+}
+```
+
+which predictors are different?
+
+## check predictors 
+
+```{r}
+norm_1 <- pred_df %>% which_predictors(.,"s1_cat_norm")
+norm_2 <- pred_df %>% which_predictors(.,"s2_cat_norm")
+
+norm <- dplyr::full_join(norm_1, norm_2, by = "pred")
+norm
+```
+
+```{r}
+het_1 <- pred_df %>% which_predictors(.,"s1_cat_het")
+het_2 <- pred_df %>% which_predictors(.,"s2_cat_het")
+
+het <- dplyr::full_join(het_1, het_2, by = "pred")
+het
+```
+
+```{r}
+out_1 <- pred_df %>% which_predictors(.,"s1_cat_out")
+out_2 <- pred_df %>% which_predictors(.,"s2_cat_out")
+
+out <- dplyr::full_join(out_1, out_2, by = "pred")
+out
+```
+
+```{r}
+inf_1 <- pred_df %>% which_predictors(.,"s1_cat_inf")
+inf_2 <- pred_df %>% which_predictors(.,"s2_cat_inf")
+
+inf <- dplyr::full_join(inf_1, inf_2, by = "pred")
+inf
+```
+
+
+```{r}
+norm %>% 
+  dplyr::full_join(., het, by = "pred") %>%
+  dplyr::full_join(., out, by = "pred") %>%
+  dplyr::full_join(., inf, by = "pred") %>%
+  View()
+```
+
+### formulas
+
+```{r}
+imputed_data$formulas$s1_cat_out
+```
+
+
+```{r}
+imputed_data$formulas$s2_cat_inf
+```
+
+
+```{r}
+lm(
+  s2_cat_inf ~ world_rank + rank_cat + ri_preferred_ht + demo_level + 
+    ri_teach + s1_boot + s2_boot + s1_hcse + s2_hcse + s2_mm + 
+    s2_plot_density + s1_inf_cook + s2_inf_cook + s1_inf_leverage + 
+    s2_inf_leverage + s2_inf_df + s1_inf_sens + s2_inf_sens + 
+    s1_inf_other + s2_inf_other + s1_inf_basic + s2_inf_basic + 
+    s1_inf_n + s2_inf_n + s1_inf_address + s2_inf_address + s1_inf_justify + 
+    s2_inf_justify + s1_cat_inf,
+   data = model_data_wide) %>% summary()
+
+model_data_wide$demo_level %>% levels()
+```
+
+```{r}
+imputed_data$formulas$s1_cat_inf
+lm(
+  s1_cat_inf ~ 0 + world_rank + rank_cat + demo_level + ri_teach + 
+    s1_boot + s1_hcse + s1_mm + s2_mm + s2_plot_density + s1_inf_cook + 
+    s2_inf_cook + s1_inf_leverage + s2_inf_leverage + s1_inf_hat + 
+    s2_inf_hat + s1_inf_df + s2_inf_df + s1_inf_sens + s2_inf_sens + 
+    s1_inf_other + s2_inf_other + s1_inf_basic + s2_inf_basic + 
+    s1_inf_n + s2_inf_n + s1_inf_address + s2_inf_address + s1_inf_justify + 
+    s2_inf_justify + s2_cat_inf, 
+   data = model_data_wide) %>% summary()
+```
+
+```{r}
+imputed_data$formulas$demo_level
+```
+
+
+1. convert mice data into 'long' data
+
+```{r}
+imputed_data_long <- mice::complete(imputed_data, "long", include = TRUE) %>% 
+  dplyr::mutate(id = .id)
+
+```
+
+2. convert into actual long format by scenario
+
+```{r}
+imputed_data_s1 <- imputed_data_long %>%
+  dplyr::select(.imp:ri_teach, contains("s1")) %>% 
+  dplyr::mutate(scenario = "s1")
+
+
+imputed_data_s2 <- imputed_data_long %>%
+  dplyr::select(.imp:ri_teach, contains("s2")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(imputed_data_s1) <- stringr::str_remove_all(pattern = "s1_", string = names(imputed_data_s1))
+names(imputed_data_s2) <- stringr::str_remove_all(pattern = "s2_", string = names(imputed_data_s2))
+
+imp_data_long <- rbind.data.frame(imputed_data_s1, imputed_data_s2)
+```
+
+```{r}
+saveRDS(imp_data_long, "../data/processed_data/imp_data_long_101021.rds")
+```
+

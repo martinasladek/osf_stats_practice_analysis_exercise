@@ -1,0 +1,570 @@
+---
+title: "data_analysis"
+author: "MS"
+date: "06/09/2021"
+output: html_document
+---
+
+IMPORTANT: The original dataset collected information about university name which was then paired with a world rank. Both of these variables could be used to identify participants at institutions which, at the time, did not tie on ranks with any other institutions. Because of this, the variables were removed from the dataset. 
+
+The variable `world_rank` was replaced with a randomly generated variable that correlated with the original rank with r = 0.9. Therefore the code below will still be able to run, however please note that any computations that use `world_rank` will not be exactly reproducible. 
+
+The main analysis in the file `analysis_models.Rmd` uses the actual data that was used to fit the models reported in the manuscript. The statistical models used a categorical version of the variable (`world_rank` split into 4 levels), which doesn't pose risk of de-identification and was therefore retained. Basically, the statistical models `analysis_models.Rmd` can be reproduced exactly, but not the imputation. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(mice)
+
+imp_data_long <- readRDS("../data/processed_data/imp_data_long_101021_world_rank_removed.rds")
+
+exp_c <- function(x){round(1/(1 + exp(x)), 3)}
+```
+
+# Prepare data for analysis 
+
+```{r}
+ordered_factor <- function(x){
+  x = factor(x, ordered = TRUE, levels = c(1,2,3))
+  return(x)
+  }
+
+imp_data_long %<>%
+  dplyr::mutate(
+    id = factor(id),
+    across(
+      .cols = cat_norm:cat_inf,
+      .fns = ordered_factor
+    ), 
+    # uni_rank_cat = case_when(
+    #   world_rank == 1500 ~ 4, 
+    #   world_rank %in% c(501:1001) ~ 3,
+    #   world_rank %in% c(201:500) ~ 2,
+    #   world_rank %in% c(1:200) ~ 1
+    # ) %>% factor(), 
+    row_names = rownames(.)
+  ) %>%
+  dplyr::group_by(.imp) %>%
+  dplyr::mutate(.id = 1:max(row_number())) %>% 
+  dplyr::ungroup() 
+
+
+imp_data_0 <- imp_data_long %>%
+  dplyr::filter(.imp == 0)
+
+imp_data_1 <- imp_data_long %>%
+  dplyr::filter(.imp == 1)
+
+imp_data_im <- mice::as.mids(long = imp_data_long)
+```
+
+```{r}
+#saveRDS(imp_data_0, "../data/processed_data/imp_data_0.rds")
+```
+
+
+# Random slopes plots 
+
+```{r fig.height = 8}
+re_plot_data <- imp_data_0 %>% 
+  dplyr::select(id, scenario, cat_out, cat_inf, cat_norm, cat_het) %>%
+  tidyr::pivot_longer(
+    cols = c(cat_out, cat_inf, cat_norm, cat_het), 
+    names_to = "assumption", 
+    values_to = "practice_cat"
+  ) %>%
+  dplyr::filter(!is.na(practice_cat)) %>% 
+  dplyr::group_by(assumption, id) %>%
+  dplyr::arrange(assumption, id, scenario) %>%
+  dplyr::mutate(
+    practice_diff = (as.numeric(practice_cat)[2] - as.numeric(practice_cat)[1]) %>% factor(., levels = c(-2, -1, 0, 1, 2))
+  )
+  
+ggplot2::ggplot(data = re_plot_data , aes(x = scenario, y = practice_cat, group = id, colour = practice_diff)) + 
+  geom_line(position = position_jitter(width = 0.15, height = 0.2, seed = 208), alpha = 0.3) + 
+  geom_point(position = position_jitter(width = 0.15, height = 0.2, seed = 208), alpha = 0.2) + 
+  scale_colour_manual(values = c("#b8002b", "#610017", "#cccccc", "#cfad72", "#c9902c", "black")) + 
+  facet_wrap(~assumption) + 
+  theme_light()
+
+
+
+```
+
+```{r}
+re_plot_data %>%
+  dplyr::filter(scenario == "s1") %>%
+  dplyr::group_by(assumption, practice_diff) %>%
+  dplyr::summarise(n = n()) %>%
+  dplyr::group_by(assumption) %>% 
+  dplyr::group_split()
+```
+
+
+# Fit models
+
+```{r}
+imp_data_list <- imp_data_long %>% 
+  dplyr::filter(., .imp != 0) %>%
+  dplyr::group_by(.imp) %>%
+  dplyr::group_split()
+
+
+imp_data_list <- purrr::map(.x = imp_data_list, .f = as.data.frame)
+
+```
+
+## outliers
+
+```{r}
+mod_out_1 <- brms::brm(
+  formula = 
+    cat_out ~ 1 + demo_level + scenario + uni_rank_cat + (1|id),
+  data = imp_data_list[[1]], 
+  family = cumulative("probit"), 
+  cores = 4
+)
+```
+
+```{r}
+exp_c <- function(x){round(1/(1 + exp(x)), 3)}
+
+re_draws_1_out <- coda::as.mcmc(mod_out_1)[[1]] %>%
+  as.data.frame() %>%
+  dplyr::select(contains("id")) %>%
+  dplyr::mutate(
+    across(.fns = exp_c)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = everything(),
+    values_to = "prob", 
+    names_to = "re"
+  )
+
+for(i in unique(as.character(data_1$id))){
+  
+  print(  
+    re_draws_1_out %>%
+      dplyr::filter(stringr::str_detect(string = re, pattern = i)) %>%
+      ggplot2::ggplot(data = ., aes(x = prob)) + 
+      labs(title = i) + 
+      geom_density(size = 2) + 
+      theme(
+        plot.title = element_text(size = 60)
+      )
+  )
+  
+}
+
+```
+
+```{r}
+imp_data_list[[1]] %>%
+  dplyr::group_by(scenario, cat_out) %>%
+  dplyr::summarise(n = n()) %>%
+  dplyr::group_by(scenario)%>%
+  dplyr::mutate(
+    percent = n/ sum(n)
+  )
+
+summary(mod_out_1)
+conditional_effects(mod_out_1, categorical = TRUE, ask = FALSE)
+```
+
+```{r}
+mod_out_fixed <- brms::brm(
+  formula = 
+    cat_out ~ 1 + demo_level + scenario + uni_rank_cat,
+  data = imp_data_list[[1]], 
+  family = cumulative("probit"), 
+  cores = 4
+)
+```
+
+```{r}
+summary(mod_out_fixed)
+conditional_effects(mod_out_fixed, categorical = TRUE, ask = FALSE)
+```
+
+
+```{r}
+set.seed(30)
+mod_out_mi <- brms::brm_multiple(
+  formula = 
+    cat_out ~ 1 + demo_level + scenario + uni_rank_cat + (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+
+
+#saveRDS(mod_out_mi, "../objects/models/mod_out_mi_220322.rds")
+
+
+```
+
+```{r}
+summary(mod_out_mi)
+```
+
+```{r}
+round(mod_out_mi$rhats, 2)
+```
+
+## influential cases 
+
+```{r}
+imp_data_0 %>% 
+  dplyr::select(id, scenario, demo_level, uni_rank_cat, cat_inf) %>%
+  dplyr::group_by(cat_inf) %>%
+  dplyr::summarise(
+    n = n()
+  )
+
+```
+
+
+```{r}
+set.seed(30)
+
+mod_inf_1 <- brms::brm(
+  formula = 
+    cat_inf ~ 1 + demo_level + scenario + uni_rank_cat+ (1|id)
+  ,
+  data = imp_data_list[[1]],
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+#saveRDS(mod_inf_1, "../objects/models/mod_inf_1_re_bad.rds")
+```
+
+```{r}
+summary(mod_inf_1)
+```
+
+```{r}
+conditional_effects(mod_inf_1, categorical = TRUE)
+```
+
+
+```{r}
+mod_inf_mi <- brms::brm_multiple(
+  formula = 
+    cat_inf ~ 1 + demo_level + scenario + uni_rank_cat,
+  data = imp_data_im, 
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+
+#saveRDS(mod_inf_mi, "../objects/models/mod_inf_mi_101121.rds")
+```
+
+```{r}
+summary(mod_inf_mi)
+```
+
+```{r}
+round(mod_inf_mi$rhats, 2)
+```
+
+s1 only: 
+
+```{r}
+imp_data_im_s1 <- mice::as.mids(long = imp_data_long %>% dplyr::filter(scenario == "s1"))
+```
+
+```{r}
+mod_inf_mi_s1 <- brms::brm_multiple(
+  formula = 
+    cat_inf ~ 1 + demo_level + uni_rank_cat,
+  data = imp_data_im_s1, 
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+saveRDS(mod_inf_mi_s1, "../objects/models/mod_inf_mi_s1_220322.rds")
+```
+
+```{r}
+imp_data_im_s2 <- mice::as.mids(long = imp_data_long %>% dplyr::filter(scenario == "s2"))
+```
+
+```{r}
+mod_inf_mi_s2 <- brms::brm_multiple(
+  formula = 
+    cat_inf ~ 1 + demo_level + uni_rank_cat,
+  data = imp_data_im_s2, 
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+#saveRDS(mod_inf_mi_s2, "../objects/models/mod_inf_mi_s2_220322.rds")
+```
+
+## normality
+
+```{r}
+mod_norm_1 <- brms::brm(
+   formula = cat_norm ~ 1 + demo_level + scenario + uni_rank_cat
+   + (1|id)
+  ,
+  data = imp_data_list[[1]], 
+  family = cumulative(link = "probit"),
+  cores = 4
+)
+
+```
+
+```{r}
+conditional_effects(mod_norm_1, categorical = TRUE)
+```
+  
+
+```{r}
+mod_norm_mi <- brms::brm_multiple(
+  formula = 
+    cat_norm ~ demo_level + scenario + uni_rank_cat 
+  + (1|id),
+  data = imp_data_im, 
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+#saveRDS(mod_norm_mi, "../objects/models/mod_norm_mi_220322.rds")
+```
+
+```{r}
+summary(mod_norm_mi)
+conditional_effects(mod_norm_mi, categorical = TRUE, plot = TRUE, ask = FALSE)
+```
+
+## heteroscedasticity
+
+```{r}
+mod_het_1 <- brms::brm(
+  formula = 
+    cat_het ~ 1 + demo_level + scenario + uni_rank_cat
+   + (1|id)
+  ,
+  data = imp_data_list[[1]], 
+  family = cumulative(link = "probit"),
+  cores = 4
+)
+```
+
+```{r}
+summary(mod_het_1)
+conditional_effects(mod_het_1, categorical = TRUE, plot = TRUE, ask = FALSE)
+```
+
+```{r}
+mod_het_1_s2 <- brms::brm(
+  formula = 
+    cat_het ~ 1 + demo_level
+  ,
+  data = imp_data_list[[1]] %>% dplyr::filter(scenario == "s2"), 
+  family = cumulative(link = "probit", threshold = "flexible"),
+  inits = 0,
+  prior = c(prior("normal(0, 4)", class = "Intercept") 
+            ),
+  cores = 4
+)
+```
+
+```{r}
+summary(mod_het_1_s2)
+conditional_effects(mod_het_1_s2, categorical = TRUE, plot = TRUE, ask = FALSE)
+```
+
+
+
+```{r}
+mod_het_mi <- brms::brm_multiple(
+  formula = 
+    cat_het ~ demo_level + scenario + uni_rank_cat 
+  + (1|id),
+  data = imp_data_im, 
+  family = cumulative("probit"), 
+  cores = 4
+)
+
+saveRDS(mod_het_mi, "../objects/models/mod_het_mi_220322.rds")
+```
+
+```{r}
+summary(mod_het_mi)
+conditional_effects(mod_het_mi, categorical = TRUE, plot = TRUE, ask = FALSE)
+```
+
+# data check
+
+```{r}
+data_check <- imp_data_list[[1]]
+data_check %>% 
+  dplyr::select(
+    id, 
+    world_rank, uni_rank_cat, 
+    demo_level, 
+    cat_norm, cat_het, cat_out, cat_inf
+  ) %>% View()
+```
+
+```{r message = F}
+data_check %>% 
+  dplyr::group_by(cat_out, scenario) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_out, demo_level) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_out, uni_rank_cat) %>%
+  dplyr::summarise(n = n())
+```
+
+```{r message = F}
+data_check %>% 
+  dplyr::group_by(cat_inf, scenario) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_inf, demo_level) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_inf, uni_rank_cat) %>%
+  dplyr::summarise(n = n())
+```
+
+
+```{r message = F}
+data_check %>% 
+  dplyr::group_by(cat_norm, scenario) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_norm, demo_level) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_norm, uni_rank_cat) %>%
+  dplyr::summarise(n = n())
+```
+
+```{r message = F}
+data_check %>% 
+  dplyr::group_by(cat_het, scenario) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_het, demo_level) %>%
+  dplyr::summarise(n = n())
+
+data_check %>% 
+  dplyr::group_by(cat_het, uni_rank_cat) %>%
+  dplyr::summarise(n = n())
+```
+
+## s1 -> s2 change
+
+```{r}
+s_change_dat <- imp_data_0 %>% 
+  dplyr::select(id, scenario, cat_out, cat_inf, cat_norm, cat_het) %>%
+  dplyr::arrange(id, scenario) %>%
+  dplyr::group_by(id) %>%
+  dplyr::mutate(
+    out_change = cat_out[1] != cat_out[2], 
+    inf_change = cat_inf[1] != cat_inf[2], 
+    norm_change = cat_norm[1] != cat_norm[2], 
+    het_change = cat_het[1] != cat_het[2]
+  )
+```
+
+
+```{r}
+s_change_dat %>%
+  dplyr::filter(
+    (any(c(out_change, inf_change, norm_change, het_change)) == TRUE) 
+    | any(is.na(c(out_change, inf_change, norm_change, het_change)))
+  )
+
+s_change_dat %>%
+  dplyr::select(id, scenario, cat_out, out_change) %>%
+  dplyr::filter(
+    out_change == TRUE
+  )
+
+s_change_dat %>%
+  dplyr::select(id, scenario, cat_inf, inf_change) %>%
+  dplyr::filter(
+    inf_change == TRUE
+  )
+
+s_change_dat %>%
+  dplyr::select(id, scenario, cat_norm, norm_change) %>%
+  dplyr::filter(
+    norm_change == TRUE
+  )
+  
+s_change_dat %>%
+  dplyr::select(id, scenario, cat_het, het_change) %>%
+  dplyr::filter(
+    het_change == TRUE
+  )
+
+
+```
+
+```{r}
+mod_out_diff <- brms::brm(
+  formula = 
+    cat_out ~ scenario 
+  + (1|id),
+  data = s_change_dat %>% dplyr::filter(out_change == TRUE), 
+  family = "bernoulli", 
+  cores = 4
+)
+```
+
+```{r}
+summary(mod_out_diff)
+conditional_effects(mod_out_diff, plot = TRUE, ask = FALSE)
+```
+
+```{r}
+re_draws_1_out_diff <- coda::as.mcmc(mod_out_diff)[[1]] %>%
+  as.data.frame() %>%
+  dplyr::select(contains("id")) %>%
+  dplyr::mutate(
+    across(.fns = exp_c)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = everything(),
+    values_to = "prob", 
+    names_to = "re"
+  )
+
+for(i in unique(as.character(data_1$id))){
+  
+  print(  
+    re_draws_1_out_diff %>%
+      dplyr::filter(stringr::str_detect(string = re, pattern = i)) %>%
+      ggplot2::ggplot(data = ., aes(x = prob)) + 
+      labs(title = i) + 
+      geom_density(size = 2) + 
+      theme(
+        plot.title = element_text(size = 60)
+      )
+  )
+  
+}
+```
+
