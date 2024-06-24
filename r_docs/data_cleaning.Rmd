@@ -1,0 +1,931 @@
+---
+title: "Untitled"
+author: "MS"
+date: "11/08/2021"
+output: html_document
+---
+
+This file cleans up the data coded my MS and VP. The IP addresses in the file and long/lat values just represent the info about the coders' computers, not participants, so this is not a data safety concern. 
+
+**IMPORTANT:** section **Researcher info and demo** merges the coded data with researchers demographics. This demographic file originally contained information about participants' universities. To preserve anonymity, this file is not provided and the code is commented out. It is still possible to reproduce the analysis - this script is meant to be followed by the `analysis_imputation.Rmd` script, which works with the version of the dataset created here which contains all the necessary demographic information with de-identified university variable. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+
+find_method <- function(search_where, search_string){
+  dplyr::if_else(stringr::str_detect(search_where, search_string), 1, 0)
+}
+
+correct_na <- function(x, col){dplyr::if_else(is.na(col), as.numeric(NA), x)}
+
+data <- readr::read_csv(
+  "../data/raw_data/statistical_practice_2021_analysis_exercise_coding_September+9%2C+2021_11.18.csv"
+)
+
+```
+
+# Basic cleaning 
+
+Remove duplicated entries: Some IDs have 3 submissions because they were coded during calibration early on, and then re-coded individually. 
+
+Other IDs have 2 submissions - these were coded at a later stage of calibration where disagreements were not substantial, so the submissions were retains. Where there were minor disagreements, MSs submission was corrected to reflect the agreed-upon version of the coding. That's why for submissions that are in the datafile 3 times, only the most recent one is kept, while for submissions that are in the dataset once, the one coded by MS is kept. 
+
+IDs with only submissions reflect the final stage of coding, respective submissions were coded only once by one of the coders. All of these are retained. 
+
+```{r}
+data %<>% 
+  dplyr::filter(row_number() > 2) %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::mutate(
+    date = lubridate::as_date(RecordedDate), 
+    count = n(),
+    keep = if_else((count == 3) & (date == max(date)), 1, 
+                   if_else((count == 2) & (coder == "MS"), 1, 
+                           if_else(count == 1, 1, 0)))
+  ) %>% 
+  dplyr::arrange(id, date) %>% 
+  #dplyr::select(date, id, count, keep) %>% 
+  dplyr::filter(keep == 1, id != "delete")
+```
+
+Check if any duplicates left
+
+```{r eval = FALSE}
+data %>% 
+  dplyr::select(id) %>% 
+  dplyr::mutate(
+    duplicated = any(duplicated(id))
+  )
+```
+Export ids for filtering with 
+
+```{r}
+# data %>% 
+#   dplyr::select(id) %>% 
+#   write.csv(., 
+#             "../data/helper_data/exercise_ids.csv", 
+#             row.names = F
+#             )
+```
+
+
+# Process variables 
+
+Set up a new env (pd = processed_data). Define id_vars for selecting
+
+```{r}
+pd <- new.env()
+id_vars = c("id", "coder")
+```
+
+Convert full dataset into long by scenario (basically chop it in a half by scenario prefix and glue underneath each other. There's probably a better way to do this.)
+
+```{r}
+data_wide_1 <-  data %>% 
+  dplyr::select(id_vars, contains("s1")) %>% 
+  dplyr::mutate(scenario = "s1")
+
+data_wide_2 <-  data %>% 
+  dplyr::select(id_vars, contains("s2")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(data_wide_1) <- stringr::str_remove_all(pattern = "s1_", string = names(data_wide_1))
+names(data_wide_2) <- stringr::str_remove_all(pattern = "s2_", string = names(data_wide_2))
+
+data_long <- dplyr::bind_rows(data_wide_1, data_wide_2)
+```
+
+```{r}
+id_vars = c(id_vars, "scenario")
+```
+
+
+## Models
+
+```{r}
+pd$models <- data_long %>% 
+  dplyr::select(id_vars, contains("model")) %>% 
+  dplyr::mutate(
+    model_spec = paste0(model, model_6_TEXT, model_7_TEXT, model_8_TEXT, model_9_TEXT, sep = " ") %>% 
+      stringr::str_remove_all(., patter = "NA") %>% tolower(), 
+    ols = find_method(model_spec, "ols|t-test|pearson"), 
+    np = find_method(model_spec, "non-parametric"),
+    welch = find_method(model_spec, "welch"),
+    boot = find_method(model_spec, "boot"),
+    wild_boot = find_method(model_spec, "wild"), 
+    hcse = find_method(model_spec, "huber|sandwich|robust standard errors"),
+    mm = find_method(model_spec, "mm|lmrob|student t"), 
+    robust_trim = find_method(model_spec, "trim"), 
+    bayes = find_method(model_spec, "bayesian|brms|bf"),
+    model = if_else((ols+ np +welch+ boot+ wild_boot+ hcse+ mm+ robust_trim+ bayes) == 0,
+                    as.character(NA), model),
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., model)
+    ), 
+  ) %>% 
+  dplyr::select(-c(model_6_TEXT, model_7_TEXT, model_8_TEXT, model_9_TEXT)) 
+
+
+```
+
+
+## Outliers and general checks 
+
+for all sensitivity analyses, check boundary cases where the analysis may have been done with a non-parametric test 
+
+### raw data plots 
+
+```{r}
+pd$plot <- data_long %>% 
+  dplyr::select(id_vars, contains("plot"))
+
+pd$plot %<>% 
+  dplyr::mutate(
+    notes = tolower(plot_4_TEXT) %>% if_else(!is.na(plot) & is.na(plot_4_TEXT), "0", .), 
+    scatter =      find_method(plot, "Scatter plot"),
+    hist =         find_method(plot, "Histogram"), 
+    violin =       find_method(notes, "violin"),  
+    density =      find_method(notes, "density"),
+    box =          find_method(notes, "box"), 
+    bean =         find_method(notes, "bean"), 
+    stem =         find_method(notes, "stem"), 
+    basic_checks = find_method(notes,"basic|descr|range|min|max|dupl|missing|explor|freq|illegal|ilegal|dupl|var|median|trim|skew|high|low|mean|observ|screen|multiple|censor|summ|extreme|count|number"), 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., plot)
+    ) 
+  ) %>% 
+  dplyr::select(-plot_4_TEXT)
+
+#names(pd$outliers_check)[5:20] <- paste0("out_", names(pd$outliers_check)[5:20])
+
+names(pd$plot)[5:13] <- paste0("plot_", names(pd$plot)[5:13])
+
+```
+
+### outliers 
+
+outlier checks
+
+```{r}
+pd$outliers <- data_long %>% 
+  dplyr::select(id_vars, contains("outlier"))
+
+pd$outliers_check <- pd$outliers %>% 
+  dplyr::select(id_vars, outliers_check, outliers_check_8_TEXT) %>% 
+  dplyr::mutate(
+    notes = tolower(outliers_check_8_TEXT) %>% 
+      if_else(!is.na(outliers_check) & is.na(outliers_check_8_TEXT), "0", .),
+    outliers_complete = paste0(outliers_check, notes, sep = ", "),
+    raw_plots = find_method(outliers_complete, "raw data plots|qq plots"), 
+    resid_plots = find_method(outliers_check, "plots of residuals"), 
+    raw_boxplots = find_method(outliers_check, "boxplots IV/DV"),
+    resid_boxplots = find_method(outliers_check, "boxplots residuals"), 
+    raw_z = find_method(outliers_complete, "Z-scores|z score"), 
+    resid_z = 0, # no-one actually did this
+    raw_sdcut = find_method(outliers_complete, "SD cut-off|sd cut-off|sd cut off|3sd|3 sd"), 
+    resid_sdcut = 0, # no-one did this
+    raw_skewkurt = find_method(outliers_complete, "raw skew"), 
+    resid_skewkurt = 0, 
+    raw_numeric = find_method(outliers_complete, "numeric checks|range|eye-ball|eye ball|cumulative|descriptive|summary"), 
+    resid_numeric = find_method(outliers_complete, "case wise diagnostics|studentized residuals|residual diagnostics (unspecified)"), 
+    raw_other = find_method(outliers_complete, "grubbs test (not on residuals)|performed unspecified checks|unspecified non-residual check"),
+    resid_other = find_method(outliers_complete, "jackknife residual > 3|sig. test of residuals|mahalanobis distance|outliertest()|grubbs test; residual diagnostics (unspecified)|rout"), 
+    sens = find_method(outliers_complete, "Sensitivity analysis - with and without|sensitivity|truncate"), 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., outliers_check)
+    ) 
+  ) %>% 
+  dplyr::select(-c(outliers_check_8_TEXT, outliers_complete))
+
+names(pd$outliers_check)[5:20] <- paste0("out_", names(pd$outliers_check)[5:20])
+
+
+```
+
+
+outlier n 
+
+```{r warning = FALSE}
+pd$outliers_n = pd$outliers %>% 
+  dplyr::select(id_vars, outliers_n) %>% 
+  dplyr::mutate(
+    out_n = readr::parse_number(outliers_n) %>% 
+      if_else(stringr::str_detect(outliers_n, "with 0"), 5, .)
+  ) %>% 
+  dplyr::select(id_vars, out_n, out_n_notes = outliers_n)
+
+```
+
+outlier address
+
+```{r}
+pd$outliers_address <- pd$outliers %>% 
+  dplyr::select(id_vars, contains("address")) %>% 
+  dplyr::mutate(
+    out_address = if_else(stringr::str_detect(outliers_address_7_TEXT, "non-parametric"), 
+                          "Fit a classic non-parametric model", 
+                          if_else(stringr::str_detect(outliers_address_7_TEXT, "eplace"), 
+                                  "Winsorize with the next largest value", 
+                                  if_else(stringr::str_detect(outliers_address_7_TEXT, "numeric"), 
+                                          "Keep outlier in the data", outliers_address))), 
+    out_address = if_else(!is.na(out_address), out_address, outliers_address)
+  ) %>% 
+  dplyr::select(id_vars, out_address)
+
+```
+
+outlier justify 
+
+```{r}
+pd$outliers_justify = pd$outliers %>%
+  dplyr::select(id_vars, contains("justify")) %>% 
+  dplyr::mutate(
+    out_justify = if_else(stringr::str_detect(outliers_justify_6_TEXT, 
+                                              "enough|information|lack of info|no sufficient reason"), 
+                          "Insufficient information to remove", "placeholder"), 
+    out_justify = if_else(stringr::str_detect(outliers_justify_6_TEXT,
+                                              "Cook's|influence measures"),
+                          "Followed-up with influence diagnostics", out_justify),
+    out_justify = if_else(stringr::str_detect(outliers_justify_6_TEXT,
+                                              "No reason to remove it|I could remove, but given the pattern to the data, I would not"),
+                          "No justification", out_justify),
+    out_justify = if_else(stringr::str_detect(outliers_justify_6_TEXT, 
+                                              ("within the range|realm of normal answers|value allowable for scale|because the range is small")), 
+                          "Outlier within range of the scale", out_justify), 
+    out_justify = if_else(!is.na(out_justify), out_justify, outliers_justify)
+  ) %>% 
+  dplyr::select(id_vars, out_justify, out_justify_notes = outliers_justify_6_TEXT) 
+
+
+
+
+```
+
+## influential cases 
+
+```{r}
+pd$inf <- data_long %>% 
+  dplyr::select(id_vars, contains("inf"))
+```
+
+check
+
+```{r}
+pd$inf_check <- pd$inf %>% 
+  dplyr::select(id_vars, contains("check")) %>% 
+  dplyr::mutate(
+    check_notes = paste0(tolower(as_check_inf), tolower(as_check_inf_4_TEXT), sep = ", ") %>% 
+      stringr::str_remove_all(., "NA"), 
+    cook = find_method(check_notes, "cook"), 
+    leverage = find_method(check_notes, "leverage"), 
+    hat = find_method(check_notes, "hat"), 
+    df = find_method(check_notes, "df"), 
+    sens = find_method(check_notes, "sensitivity"), 
+    other = find_method(check_notes, "pareto|rout|sequential"), 
+    basic = find_method(check_notes, "missing|boxplot|residual"),
+    check = as_check_inf, 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., check)
+    ) 
+  ) %>% 
+  dplyr::select(-c(as_check_inf, as_check_inf_4_TEXT))
+
+names(pd$inf_check)[4:12] <- paste0("inf_", names(pd$inf_check)[4:12])
+
+```
+
+address
+
+```{r}
+pd$inf_address <- pd$inf %>% 
+  dplyr::select(id_vars, contains("address")) %>% 
+  dplyr::mutate(
+    address_notes = paste0(as_address_inf, as_address_inf_4_TEXT, 
+                           as_address_inf_7_TEXT, as_address_inf_8_TEXT) %>% 
+      stringr::str_remove_all(., "NA") %>% tolower(),
+    address = case_when(
+      stringr::str_detect(address_notes, "robust") ~ "Fit a robust model", 
+      stringr::str_detect(address_notes, "remove|fitted an alternative") ~ "Remove case from the data",
+      stringr::str_detect(address_notes, "keep|not addressed") ~ "Keep case in the data",
+      TRUE ~ as_address_inf
+    )
+  ) %>% 
+  dplyr::select(-c(as_address_inf_4_TEXT, as_address_inf_7_TEXT, as_address_inf_8_TEXT, as_address_inf))
+
+names(pd$inf_address)[4:5] <- paste0("inf_", names(pd$inf_address)[4:5])
+
+
+```
+
+inf_n
+
+```{r warning = FALSE}
+pd$inf_n = pd$inf %>% 
+  dplyr::select(id_vars, inf_n_notes = inf_n) %>% 
+  dplyr::mutate(
+    inf_n = readr::parse_number(inf_n_notes), 
+    inf_n_notes = if_else(inf_n_notes == "JNA", as.character(NA), inf_n_notes)
+  ) 
+
+```
+
+justify
+
+```{r}
+pd$inf_justify = pd$inf %>% 
+  dplyr::select(id_vars, inf_n, contains("justify")) %>% 
+  dplyr::mutate(
+    inf_n = if_else(inf_n == "JNA", as.character(NA), inf_n),
+    justify_notes = paste0(as_justify_inf, as_justify_inf_4_TEXT, sep = ", ") %>% 
+      stringr::str_remove_all(., "NA") %>% tolower(), 
+    inf_justify = if_else(!is.na(inf_n), "No justification", as.character(NA)),
+    inf_justify = if_else(stringr::str_detect(justify_notes, "severe enough"), 
+                          "Influential case not severe enough", inf_justify),
+    inf_justify = if_else(stringr::str_detect(justify_notes, "range is small"), 
+                          "Influential case within range of the scale", inf_justify)
+  ) %>% dplyr::select(-inf_n, -as_justify_inf)
+```
+
+## assumptions
+
+### general
+
+```{r}
+pd$as_mention <- data_long %>% 
+  dplyr::select(id_vars, contains("mention")) %>% 
+  dplyr::mutate(
+    as_norm = find_method(as_mention, "Normality"),
+    as_het = find_method(as_mention, "Homogeneity"),
+    as_ind = find_method(as_mention, "Independ"),
+    as_lin = find_method(as_mention, "Linearity"),
+    as_add = find_method(as_mention, "Additivity"), 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., as_mention)
+    ) 
+  ) 
+
+```
+
+### normality 
+
+```{r}
+pd$norm <- data_long %>% 
+  dplyr::select(id_vars, contains("norm"))
+```
+
+check
+
+```{r}
+pd$norm_check <- pd$norm %>% 
+  dplyr::select(id_vars, contains("check")) %>% 
+  dplyr::mutate(
+    check_notes = paste0(as_check_norm, as_check_norm_8_TEXT, sep = ", ") %>% 
+      stringr::str_remove_all(., "NA") %>% tolower(), 
+    raw_hist = find_method(check_notes, "histograms of dependent"), 
+    resid_hist = find_method(check_notes, "histograms of the residuals"), 
+    raw_qq = find_method(check_notes, "qq or pp plots of dv/iv"),
+    resid_qq = find_method(check_notes, "qq or pp plots of the residuals"),
+    raw_density = if_else(as_check_norm_8_TEXT %in% c("Densitity plots of DV", "density plot", "density plots"), 1, 0), 
+    resid_density = find_method(check_notes, "density plot of residuals"), 
+    raw_stem = find_method(check_notes, "stem|leaf"), 
+    resid_stem = 0, # no-one did this
+    raw_sig = find_method(check_notes, "iv/dv: significance test|anderson-darling"), 
+    resid_sig = find_method(check_notes, "residuals: significance test"), 
+    raw_skewkurt = find_method(check_notes, "skew|kurt"), 
+    resid_skewkurt = 0, # no-one did this
+    raw_other = find_method(check_notes, "frequencies|stats summaries"), 
+    resid_other = 0, # no other residual checks, 
+    sens = find_method(check_notes, "sensitivity"), 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., as_check_norm)
+    ) 
+  ) %>% 
+  dplyr::select(-c(as_check_norm, as_check_norm_8_TEXT))
+
+names(pd$norm_check)[4:19] <- paste0("norm_", names(pd$norm_check)[4:19])
+
+```
+
+address
+
+```{r}
+pd$norm_address <- pd$norm %>% 
+  dplyr::select(id_vars, contains("address")) %>% 
+  dplyr::mutate(
+    norm_address = as_address_norm, 
+    norm_address = if_else(norm_address == "Fit a robust model (other than bootstrapping; describe)", 
+                           "Fit a robust model", norm_address), 
+    norm_address = if_else(norm_address == "Transform variables (describe)",
+                           "Transform variables", norm_address),
+    norm_address = if_else(norm_address == "Transform variables (describe),Other (describe)",
+                           "Transform variables", norm_address),
+    norm_address = case_when(
+      stringr::str_detect(as_address_norm_4_TEXT, "remove") | 
+        stringr::str_detect(as_address_norm_8_TEXT, "remove")  ~ "Remove outliers",
+      stringr::str_detect(as_address_norm_8_TEXT, "robust") ~ "Fit a robust model",
+      stringr::str_detect(as_address_norm_8_TEXT, "classic non-parametric") ~ "Fit a classic non-parametric model", 
+      stringr::str_detect(as_address_norm_8_TEXT, "median split") ~ "Transform variables",
+      TRUE ~ norm_address), 
+    norm_address_notes = paste0(as_address_norm, as_address_norm_4_TEXT, 
+                                as_address_norm_7_TEXT, as_address_norm_8_TEXT, sep = ", ") %>% 
+      stringr::str_remove_all(., "NA") %>% tolower(),
+  ) %>% dplyr::select(id_vars, norm_address, norm_address_notes)
+
+```
+
+justify
+
+```{r}
+pd$norm_justify <- pd$norm %>% 
+  dplyr::select(id_vars, contains("justify")) %>% 
+  dplyr::mutate(
+    norm_justify = case_when(
+      stringr::str_detect(as_justify_norm, "Central Limit Theorem") ~ "Central Limit Theorem", 
+      stringr::str_detect(as_justify_norm_6_TEXT, "might not pass the normality test") ~ "Normality test is unreliable",
+      TRUE ~ as_justify_norm
+    )
+  ) %>% 
+  dplyr::select(id_vars, norm_justify_notes = as_justify_norm_6_TEXT, norm_justify)
+
+
+```
+
+### homoscedasticity
+
+```{r}
+pd$het <- data_long %>% 
+  dplyr::select(id_vars, contains("_h"))
+```
+
+```{r}
+pd$het_check <- pd$het %>% 
+  dplyr::select(id_vars, contains("check")) %>% 
+  dplyr::mutate(
+    raw_box = find_method(as_check_h, "Boxplots IV/DV"), 
+    resid_box = find_method(as_check_h, "Boxplots residuals"),
+    sig = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)),
+                      "levene|barlett|pagan|non-constant"),
+    raw_plots = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                            "histogram of groups|plots of raw data|raw data plot|raw scatterplot"), 
+    resid_plots = find_method(as_check_h, 
+                              "Plots of residuals"),
+    eye = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                      "descriptive stats - variances|eye"), 
+    vr = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                     "ratio"), 
+    equaln = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                         "assumed homogeneity because n|group numbers are equal"), 
+    robust = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                         "robust|sandwich"), 
+    welch = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                        "welch"), 
+    sens = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                       "sensitivity"), 
+    raw_other = find_method(tolower(paste0(as_check_h, as_check_h_6_TEXT)), 
+                            "unspecified checks prior to data fitting"), 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., as_check_h)
+    ) 
+  ) %>% 
+  dplyr::rename(check = as_check_h)
+
+names(pd$het_check)[4:17] <- paste0("het_", names(pd$het_check)[4:17])
+
+```
+
+address
+
+```{r}
+pd$het_address <- pd$het %>% 
+  dplyr::select(id_vars, contains("address")) %>% 
+  dplyr::mutate(
+    het_address = case_when(
+      stringr::str_detect(as_address_h, 
+                          "Fit other robust model|heteroscedasticity consistent") |
+        stringr::str_detect(as_address_h_10_TEXT, 
+                            "robust") ~ "Fit a robust model", 
+      stringr::str_detect(as_address_h, "Other") ~ "Other", 
+      stringr::str_detect(as_address_h, "Transform variables") ~ "Transform variables", 
+      TRUE ~ as_address_h
+    )
+  )
+
+```
+
+justify
+
+```{r}
+pd$het_justify <- pd$het %>% 
+  dplyr::select(id_vars, contains("justify")) %>% 
+  dplyr::rename(het_justify = as_justify_h, het_notes = as_justify_h_6_TEXT) %>% 
+  dplyr::mutate(
+    het_justify = case_when(
+      het_justify == "Violation not severe enough to impact the analysis,Other (describe)" ~ "Violation not severe enough to impact the analysis", 
+      TRUE ~ het_justify
+    )
+  )
+
+
+```
+
+### linearity 
+
+```{r}
+pd$lin <- data_long %>% 
+  dplyr::select(id_vars, contains("lin"))
+```
+
+check
+
+```{r}
+pd$lin_check <-  pd$lin %>% 
+  dplyr::select(id_vars, contains("check")) %>% 
+  dplyr::mutate(
+    lin_resid_plots = find_method(as_check_lin, "Plots of residuals"), 
+    lin_raw_plots = find_method(paste0(as_check_lin, as_check_lin_4_TEXT), 
+                                "aw data plot|scatter|plot of raw data|raw|Raw"),
+    lin_fit_curve = find_method(paste0(as_check_lin, as_check_lin_4_TEXT), 
+                                "curature|examining a non-linear effect|non-linear trend|fractional polynomial|additive model|quadratic|poly model|quadratic term"), 
+    lin_other = find_method(paste0(as_check_lin, as_check_lin_4_TEXT), 
+                            "split time|linear term contrasts"),
+    lin_check = case_when(
+      stringr::str_detect(as_check_lin_4_TEXT, "missing") ~ as.character(NA), 
+      TRUE ~ as_check_lin
+    ), 
+    across(
+      .cols = where(is.numeric), 
+      .fns = ~correct_na(., lin_check)
+    ), 
+    lin_check_notes = as_check_lin_4_TEXT
+  ) %>% 
+  dplyr::select(-c(as_check_lin, as_check_lin_4_TEXT))
+
+
+```
+
+address
+
+(I'm leaving this as is because the 4 people that did something unique did all a different thing)
+
+```{r}
+pd$lin_address <- pd$lin %>% 
+  dplyr::select(id_vars, contains("address")) %>% 
+  dplyr::mutate(
+    lin_address = case_when(
+      as_address_lin == "Other (describe)" ~ "Other", 
+      TRUE ~ as_address_lin
+    ), 
+    lin_address_notes = paste0(as_address_lin, as_address_lin_4_TEXT, as_address_lin_5_TEXT, sep = ", ") %>% 
+      stringr::str_remove_all("NA") %>% tolower()
+  ) %>% 
+  dplyr::select(-c(as_address_lin, as_address_lin_4_TEXT, as_address_lin_5_TEXT))
+
+```
+
+justify
+
+```{r}
+pd$lin_justify <- pd$lin %>% 
+  dplyr::select(id_vars, contains("justify")) %>% 
+  dplyr::mutate(
+    lin_justify = case_when(
+      as_lin_justify == "Other (describe)" ~ "Other", 
+      TRUE ~ as_lin_justify
+    ), 
+    lin_justify_notes = paste0(as_lin_justify, as_lin_justify_4_TEXT, sep = ", ") %>% 
+      stringr::str_remove_all("NA") %>% tolower()
+  ) %>% 
+  dplyr::select(-c(as_lin_justify, as_lin_justify_4_TEXT))
+
+
+```
+
+
+
+
+# data merge
+
+```{r}
+pd$data <- 
+  dplyr::left_join(pd$models, pd$plot, by = id_vars) %>% 
+  dplyr::left_join(., pd$outliers_check, by = id_vars) %>% 
+  dplyr::left_join(., pd$outliers_n, by = id_vars) %>% 
+  dplyr::left_join(., pd$outliers_address, by = id_vars) %>% 
+  dplyr::left_join(., pd$outliers_justify, by = id_vars) %>% 
+  dplyr::left_join(., pd$inf_check, by = id_vars) %>% 
+  dplyr::left_join(., pd$inf_n, by = id_vars) %>% 
+  dplyr::left_join(., pd$inf_address, by = id_vars) %>% 
+  dplyr::left_join(., pd$inf_justify, by = id_vars) %>% 
+  dplyr::left_join(., pd$as_mention, by = id_vars) %>% 
+  dplyr::left_join(., pd$norm_check, by = id_vars) %>%
+  dplyr::left_join(., pd$norm_address, by = id_vars) %>% 
+  dplyr::left_join(., pd$norm_justify, by = id_vars) %>% 
+  dplyr::left_join(., pd$het_check, by = id_vars) %>%
+  dplyr::left_join(., pd$het_address, by = id_vars) %>% 
+  dplyr::left_join(., pd$het_justify, by = id_vars) %>% 
+  dplyr::left_join(., pd$lin_check, by = id_vars) %>%
+  dplyr::left_join(., pd$lin_address, by = id_vars) %>% 
+  dplyr::left_join(., pd$lin_justify, by = id_vars) 
+
+
+```
+
+# duplicate names and missing values
+
+check if any cols duplicated: 
+
+```{r eval = F}
+pd$data %>% dplyr::select(contains("."))
+```
+
+Populate "justify" options with "no checks performed" or "no violations found"
+
+outliers: 
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    out_justify = case_when(
+      outliers_check == "No checks performed" ~ "No checks performed", 
+      is.na(out_address) ~ as.character(NA), 
+      out_address == "No outliers detected" ~ "No outliers detected", 
+      !out_address %in% c("Keep outlier in the data", "No checks performed", 
+                          "No outliers detected") ~ "Outliers addressed",
+      is.na(outliers_check) ~ as.character(NA), 
+      TRUE ~ out_justify
+    ),
+    out_address = case_when(
+      outliers_check == "No checks performed" & !is.na(out_address) ~ "No checks performed", 
+      TRUE ~ out_address
+    ), 
+    out_n = case_when(
+      out_address == "No checks performed" ~ -1, 
+      TRUE ~ out_n
+    )
+  )
+```
+
+influential cases: 
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    inf_justify = case_when(
+      inf_address == "No violations found" ~ "No violations found", 
+      inf_address == "No checks performed" ~ "No checks performed", 
+      stringr::str_detect(inf_address_notes, "remove|robust|sens") ~ "Influential cases addressed",
+      TRUE ~ inf_justify
+    ), 
+    inf_n = case_when(
+      inf_address == "No checks performed" ~ -1, 
+      inf_address == "No violations foind" ~ 0, 
+      TRUE ~ inf_n
+    )
+  )
+```
+
+normality: 
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    norm_justify = case_when(
+      norm_address == "No checks performed" ~ "No checks performed", 
+      norm_address == "No violations found" ~ "No violations found",
+      norm_address %in% c("Transform variables", "Remove outliers", 
+                          "Apply bootstrapping", "Fit a classic non-parametric model", 
+                          "Fit a robust model") ~ "Normality addressed",
+      TRUE ~ norm_justify
+    )
+  ) 
+```
+
+heterogeneity
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    het_justify = case_when(
+      het_address == "No checks performed" ~ "No checks performed", 
+      het_address == "No violations found" ~ "No violations found", 
+      het_address %in% c("Apply bootstrapping", "Fit a robust model", 
+                         "Transform variables", "Welch's F or James's F", 
+                         "Fit a classic non-parametric model") ~ "Heterogeneity addressed",
+      !is.na(as_address_h_10_TEXT) ~ "Heterogeneity addressed",
+      TRUE ~ het_justify
+    )
+  ) 
+```
+
+linearity 
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    lin_justify = case_when(
+      lin_address == "No checks performed" ~ "No checks performed", 
+      lin_address == "No violations found" ~ "No violations found", 
+      lin_address == "Violations found but not addressed" ~ "No justification",
+      lin_address == "Other" ~ "Linearity addressed", 
+      TRUE ~ lin_justify
+    )
+  ) 
+```
+
+----------
+
+# Researcher info and demo
+
+```{r}
+#pd$ri <- read.csv("../data/processed_data/analysis_exercise_ri_merged.csv", encoding = "UTF-8")
+```
+
+Merge with the rest of the data 
+
+```{r}
+# pd$data %<>% 
+#   dplyr::left_join(., pd$ri, by = "id")
+```
+
+# Compute practice categories
+
+## normality
+
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    cat_norm_1 = if_else(norm_address == "No checks performed", 1, 0), 
+    cat_norm_2 = case_when(any(c(norm_raw_hist, norm_raw_qq, norm_raw_density, norm_raw_stem, 
+                                 norm_raw_sig, norm_raw_skewkurt, norm_raw_other) == 1) ~ 1, 
+                           TRUE ~ 0),
+    cat_norm_3 = case_when(any(c(norm_resid_hist, norm_resid_qq, norm_resid_density, norm_resid_stem, 
+                                 norm_resid_sig, norm_resid_skewkurt, norm_resid_other) == 1) ~1, 
+                           TRUE ~ 0),
+    cat_norm_4 = case_when(cat_norm_3 == 1 & norm_address %in% c(
+      "Remove outliers", "Transform variables", "Fit a classic non-parametric model") ~1, 
+      TRUE ~ 0), 
+    cat_norm_5 = case_when(norm_sens == 1 | boot == 1 | mm == 1 | robust_trim == 1 | 
+                             norm_address %in% c("Fit a robust model", "Apply bootstrapping") ~ 1, 
+                           TRUE ~ 0),
+    cat_norm = case_when(
+      cat_norm_5 == 1 ~ 5, 
+      cat_norm_4 == 1 & cat_norm_5 == 0 ~ 4, 
+      cat_norm_3 == 1 & cat_norm_5 == 0 & cat_norm_4 == 0 ~ 3, 
+      cat_norm_2 == 1 & cat_norm_5 == 0 & cat_norm_4 == 0 & cat_norm_3 == 0 ~ 2,
+      cat_norm_1 == 1 & cat_norm_5 == 0 & cat_norm_4 == 0 & cat_norm_3 == 0 & cat_norm_2 == 0 ~ 1, 
+      TRUE ~ as.double(NA)
+    ),
+    cat_norm = case_when(
+      is.na(norm_address) ~ as.double(NA), 
+      TRUE ~ cat_norm
+    )
+  ) %>% 
+  dplyr::select(-c(cat_norm_1, cat_norm_2, cat_norm_3, cat_norm_4, cat_norm_5))
+
+```
+
+## heteroscedasticity
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    cat_het_1 = if_else(het_address == "No checks performed", 1, 0), 
+    cat_het_2 = case_when(any(c(het_raw_box, het_raw_plots, het_eye, het_equaln, 
+                                 het_raw_other) == 1) ~ 1, 
+                           TRUE ~ 0),
+    cat_het_3 = case_when(any(c(het_resid_box, het_sig, het_resid_plots) == 1) ~1, 
+                           TRUE ~ 0),
+    cat_het_4 = case_when(cat_het_3 == 1 & het_address %in% c(
+      "Apply bootstrapping", "Transform variables", "Fit a classic non-parametric model", "Other") ~1, 
+      TRUE ~ 0), 
+    cat_het_5 = case_when(het_sens == 1 | het_robust == 1 |het_welch == 1 |
+                            mm == 1 | robust_trim == 1 | welch == 1 | hcse == 1 |
+                            wild_boot == 1 | 
+                            het_address %in% c("Fit a robust model") ~ 1, 
+                           TRUE ~ 0),
+    cat_het = case_when(
+      cat_het_5 == 1 ~ 5, 
+      cat_het_4 == 1 & cat_het_5 == 0 ~ 4, 
+      cat_het_3 == 1 & cat_het_5 == 0 & cat_het_4 == 0 ~ 3, 
+      cat_het_2 == 1 & cat_het_5 == 0 & cat_het_4 == 0 & cat_het_3 == 0 ~ 2,
+      cat_het_1 == 1 & cat_het_5 == 0 & cat_het_4 == 0 & cat_het_3 == 0 & cat_het_2 == 0 ~ 1, 
+      TRUE ~ as.double(NA)
+    ),
+    cat_het = case_when(
+      is.na(het_address) ~ as.double(NA), 
+      TRUE ~ cat_het
+    )
+  ) %>% 
+  dplyr::select(-c(cat_het_1, cat_het_2, cat_het_3, cat_het_4, cat_het_5))
+```
+
+## general checks and outliers
+
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    cat_out_1 = if_else(plot == "No plot of raw data", 1, 0), 
+    cat_out_2 = case_when(any(c(plot_scatter, plot_hist, plot_violin, plot_density, 
+                                plot_box, plot_bean, plot_stem, plot_basic_checks, 
+                                out_raw_plots, out_raw_boxplots, out_raw_z, out_raw_sdcut,
+                                out_raw_skewkurt, out_raw_numeric, out_raw_other) == 1) ~ 1, 
+                           TRUE ~ 0),
+    cat_out_3 = case_when(any(c(out_resid_plots, out_resid_boxplots, out_resid_z, out_resid_sdcut,
+                                out_resid_skewkurt, out_resid_numeric, out_resid_other) == 1) ~1, 
+                           TRUE ~ 0),
+    cat_out_4 = case_when(cat_out_3 == 1 & 
+                            (out_address %in% c("Remove outlier from the data", 
+                                                "Winsorize with the next largest value", 
+                                                "Fit a classic non-parametric model") | 
+                               out_justify %in% c("Followed-up with influence diagnostics", 
+                                                  "Insufficient information to remove")
+                            ) ~ 1, 
+                             TRUE ~ 0),
+    cat_out_5 = case_when(out_sens == 1 | boot == 1 | wild_boot == 1 |
+                            mm == 1 | robust_trim == 1 | hcse == 1 |
+                            wild_boot == 1 | 
+                            out_address %in% c("Fit a robust model (describe)") ~ 1, 
+                           TRUE ~ 0),
+    cat_out = case_when(
+      cat_out_5 == 1 ~ 5, 
+      cat_out_4 == 1 & cat_out_5 == 0 ~ 4, 
+      cat_out_3 == 1 & cat_out_5 == 0 & cat_out_4 == 0 ~ 3, 
+      cat_out_2 == 1 & cat_out_5 == 0 & cat_out_4 == 0 & cat_out_3 == 0 ~ 2,
+      cat_out_1 == 1 & cat_out_5 == 0 & cat_out_4 == 0 & cat_out_3 == 0 & cat_out_2 == 0 ~ 1, 
+      TRUE ~ as.double(NA)
+    ),
+    cat_out = case_when(
+      is.na(out_address) ~ as.double(NA), 
+      TRUE ~ cat_out
+    )
+  ) %>%
+  dplyr::select(-c(cat_out_1, cat_out_2, cat_out_3, cat_out_4, cat_out_5))
+```
+
+## influential cases
+
+```{r}
+pd$data %<>% 
+  dplyr::mutate(
+    cat_inf_1 = if_else(inf_address == "No checks performed", 1, 0), 
+    cat_inf_2 = case_when(any(c(inf_basic) == 1) ~ 1, 
+                           TRUE ~ 0),
+    cat_inf_3 = case_when(any(c(inf_other, inf_hat, inf_cook, inf_leverage) == 1) ~1, 
+                           TRUE ~ 0),
+    cat_inf_4 = case_when(cat_inf_3 == 1 & inf_address %in% c(
+      "Remove case from the data") ~1, 
+      TRUE ~ 0), 
+    cat_inf_5 = case_when(inf_sens == 1 | inf_df == 1 |
+                            mm == 1 | robust_trim == 1 | hcse == 1 |
+                            wild_boot == 1 | boot == 1 | 
+                            inf_address %in% c("Fit a robust model") ~ 1, 
+                           TRUE ~ 0),
+    cat_inf = case_when(
+      cat_inf_5 == 1 ~ 5, 
+      cat_inf_4 == 1 & cat_inf_5 == 0 ~ 4, 
+      cat_inf_3 == 1 & cat_inf_5 == 0 & cat_inf_4 == 0 ~ 3, 
+      cat_inf_2 == 1 & cat_inf_5 == 0 & cat_inf_4 == 0 & cat_inf_3 == 0 ~ 2,
+      cat_inf_1 == 1 & cat_inf_5 == 0 & cat_inf_4 == 0 & cat_inf_3 == 0 & cat_inf_2 == 0 ~ 1, 
+      TRUE ~ as.double(NA)
+    ),
+    cat_inf = case_when(
+      is.na(inf_address) ~ as.double(NA), 
+      TRUE ~ cat_inf
+    )
+  ) %>% 
+  dplyr::select(-c(cat_inf_1, cat_inf_2, cat_inf_3, cat_inf_4, cat_inf_5))
+```
+
+```{r}
+pd$data %<>% dplyr::select(-uni_name)
+```
+
+
+# Export data
+
+```{r eval = FALSE}
+saveRDS(pd$data, 
+          "../data/processed_data/analysis_exercise_processed_data_2021_10_07.rds")
+```
+
+
+
+
+
+
+
+
